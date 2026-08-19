@@ -17,6 +17,7 @@ import os
 import json
 import time
 import glob
+import shutil
 import datetime as dt
 
 import pandas as pd
@@ -317,6 +318,45 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
   border-color: #475569 !important;
 }}
 
+/* El multiselect ("Cuentas", "Añadir más al detalle") tiene, además, un
+   div intermedio SIN data-testid con fondo blanco propio (comprobado en
+   vivo: hijo directo de .react-aria-ComboBox, la clase de la librería que
+   usa Streamlit por debajo — esa sí es estable entre versiones, a
+   diferencia de sus clases "st-emotion-cache-xxxxx" generadas, que
+   cambian). */
+.react-aria-ComboBox, .react-aria-ComboBox > div {{
+  background-color: var(--card) !important;
+  border-color: var(--border) !important;
+}}
+
+/* primaryColor (#22C55E) tampoco se aplica en Streamlit Cloud en varios
+   sitios nativos — sale el rojo por defecto de Streamlit (#FF4B4B) en su
+   lugar: pestaña activa, botón activo de un segmented_control, chips de
+   un multiselect y la casilla marcada de un checkbox. Mismo patrón que el
+   fondo blanco de arriba: se fuerza aquí en vez de fiarse del tema. */
+[data-testid="stTab"][aria-selected="true"] {{
+  border-bottom-color: var(--pos) !important;
+  color: var(--pos) !important;
+}}
+.react-aria-SelectionIndicator {{
+  background-color: var(--pos) !important;
+}}
+[data-testid="stButtonGroup"] button[aria-pressed="true"] {{
+  background-color: rgba(34,197,94,.1) !important;
+  border-color: var(--pos) !important;
+  color: var(--pos) !important;
+}}
+[data-testid="stMultiSelectTagsContainer"] span[role="group"] {{
+  background-color: var(--pos) !important;
+  color: #04140A !important;
+}}
+[data-testid="stMultiSelectTagsContainer"] span[role="group"] svg {{
+  color: #04140A !important;
+}}
+[data-testid="stCheckbox"] [data-selected="true"] * {{
+  background-color: var(--pos) !important;
+}}
+
 @media (prefers-reduced-motion: reduce) {{
   * {{ transition:none !important; animation:none !important; }}
 }}
@@ -384,19 +424,21 @@ def license_gate() -> str:
     puede introducir o renovar el código en cualquier momento, no solo la
     primera vez. Lo que precarga y guarda en disco es el ÚLTIMO CÓDIGO
     VÁLIDO conocido, no lo último que se haya tecleado: un intento fallido
-    no borra el que ya funcionaba."""
-    st.sidebar.markdown(f'<div class="vf-brand">{svg("target", 22)}VeriFine</div>',
-                        unsafe_allow_html=True)
+    no borra el que ya funcionaba.
+
+    Se llama DENTRO del expander colapsable de main() — por eso usa st.X
+    en vez de st.sidebar.X (así respeta el contenedor activo; st.sidebar.X
+    se saltaría el expander e iría directo a la raíz del sidebar)."""
     saved = L.LicenseState.load(LICENSE_PATH)  # último código VÁLIDO conocido
 
-    st.sidebar.markdown(f'<div class="vf-sec" style="margin:4px 0 2px;">{svg("target", 16)}'
-                        '<h3 style="font-size:13px;">Licencia</h3></div>', unsafe_allow_html=True)
-    typed = st.sidebar.text_input(
+    st.markdown(f'<div class="vf-sec" style="margin:4px 0 2px;">{svg("target", 16)}'
+               '<h3 style="font-size:13px;">Licencia</h3></div>', unsafe_allow_html=True)
+    typed = st.text_input(
         "Código de licencia", value=saved.code,
         help="Lo tienes en el último correo de pago de tu suscripción de Substack.")
     if typed != saved.code:
         _fetch_valid_codes_cached.clear()  # código nuevo: no esperar a que caduque la caché de 1h
-    st.sidebar.button("Verificar licencia")  # el propio cambio de campo ya dispara el rerun
+    st.button("Verificar licencia")  # el propio cambio de campo ya dispara el rerun
 
     attempt = L.LicenseState(code=typed, last_ok=saved.last_ok)
     ok, level, msg = L.evaluate(attempt, _fetch_valid_codes_cached())
@@ -405,21 +447,21 @@ def license_gate() -> str:
         # Validado de verdad contra el manifiesto (o licencia desactivada,
         # §evaluate): éste pasa a ser el último código válido guardado.
         attempt.save(LICENSE_PATH)
-        st.sidebar.caption("Licencia activa ✓")
+        st.caption("Licencia activa ✓")
         return "full"
 
     if ok:  # level == "warning": modo de gracia offline, por el código YA
         # guardado — no se ha comprobado lo tecleado, así que no se toca
         # el fichero (evaluate() tampoco cambia last_ok en este caso).
-        st.sidebar.warning(msg)
+        st.warning(msg)
         return "full"
 
     # No autoriza: NO se toca el último código válido guardado — un
     # intento fallido (typo, código de otro mes) no debe borrar el bueno.
-    st.sidebar.info(f"**Modo de prueba** — histórico limitado a {TRIAL_MONTHS} meses y "
-                    "Efecto divisa/Operaciones/Informe bloqueadas hasta verificar la "
-                    "licencia. El código está en el último correo de pago de tu "
-                    "suscripción de Substack.")
+    st.info(f"**Modo de prueba** — histórico limitado a {TRIAL_MONTHS} meses y "
+           "Efecto divisa/Operaciones/Informe bloqueadas hasta verificar la "
+           "licencia. El código está en el último correo de pago de tu "
+           "suscripción de Substack.")
     return "trial"
 
 
@@ -430,7 +472,8 @@ def _tab_gate(license_mode: str) -> bool:
     if license_mode == "full":
         return True
     st.info("Disponible con licencia activa. El código está en el último correo de pago "
-            "de tu suscripción de Substack — introdúcelo en **Licencia**, en el sidebar.")
+            "de tu suscripción de Substack — despliega **Conexión y licencia**, en el "
+            "sidebar, e introdúcelo ahí.")
     return False
 
 
@@ -443,15 +486,18 @@ def load_paths(paths: tuple[str, ...]) -> P.Dataset:
     return P.load(list(paths))
 
 
-def sidebar_source(license_mode: str = "full") -> P.Dataset | None:
+def _connection_fields() -> tuple[str, str]:
+    """Token, Query ID, "Recordar" y el selector de carpeta. Se llama DENTRO
+    del expander colapsable de main() (igual que license_gate(), ver su
+    docstring) — de ahí st.X en vez de st.sidebar.X."""
     # Un único camino: conectar con IBKR. Sin opción de subir XML a mano —
     # lo ya descargado en sesiones anteriores se sigue leyendo solo, más
     # abajo, sin que haga falta tocar el token para volver a verlo.
-    st.sidebar.caption("El token da acceso de lectura a tus extractos.")
+    st.caption("El token da acceso de lectura a tus extractos.")
     saved_token, saved_qid = _load_ibkr_creds()
-    token = st.sidebar.text_input("Token", type="password", value=saved_token)
-    qid = st.sidebar.text_input("Query ID", value=saved_qid)
-    remember = st.sidebar.checkbox(
+    token = st.text_input("Token", type="password", value=saved_token)
+    qid = st.text_input("Query ID", value=saved_qid)
+    remember = st.checkbox(
         "Recordar en este equipo", value=bool(saved_token or saved_qid),
         help="Guarda el token y el Query ID en tu propio disco "
              f"({IBKR_CREDS_PATH}) para no tener que repetirlos cada vez. "
@@ -462,11 +508,140 @@ def sidebar_source(license_mode: str = "full") -> P.Dataset | None:
     elif saved_token or saved_qid:
         _clear_ibkr_creds()
 
-    with st.sidebar:
-        picker = _folder_picker(key="folder_picker")
+    picker = _folder_picker(key="folder_picker")
     if picker and picker.get("picked"):
         st.session_state["chosen_folder_name"] = picker["name"]
 
+    return token, qid
+
+
+def _danger_zone():
+    """Borra TODO (extractos, estado de sincronización, credenciales
+    recordadas, licencia) — para empezar de cero. Mismo sitio que
+    _connection_fields(): dentro del expander colapsable de main()."""
+    st.divider()
+    st.caption("Borra todos los extractos descargados, el estado de "
+              "sincronización, el token/Query ID recordados en este equipo "
+              "y el código de licencia. No se puede deshacer — la próxima "
+              "vez hay que sincronizar desde cero.")
+    confirm_wipe = st.checkbox("Confirmo que quiero borrarlo todo", key="confirm_wipe_all")
+    if st.button("Borrar todo y empezar de nuevo", disabled=not confirm_wipe):
+        shutil.rmtree(RAW_DIR, ignore_errors=True)
+        st.session_state.clear()
+        st.rerun()
+
+
+def _incremental_parse_fn(raw_path: str) -> tuple[dict[str, float], list[str]]:
+    """(nav_por_fecha, fechas) del bloque recién descargado — mismo
+    callback que necesita q4_sync.daily_job(), ver q4_daily.py:parse_fn."""
+    block = P.load([raw_path])
+    return P.nav_series(block), block.dates
+
+
+def _incremental_recompute_fn() -> dict[str, float]:
+    """TWR EUR de cada año CERRADO sobre TODO el histórico (canario §19.6),
+    para q4_sync.daily_job() — mismo cálculo que q4_daily.py:recompute_fn,
+    duplicado a propósito: son entrypoints independientes (uno es el cron,
+    éste la app interactiva), no comparten proceso."""
+    all_raws = sorted(glob.glob(os.path.join(RAW_DIR, "*.xml")))
+    ds_all = P.load(all_raws)
+    dates = ds_all.dates
+    this_year = dt.date.today().year
+    out: dict[str, float] = {}
+    for y in sorted({int(d[:4]) for d in dates}):
+        if y >= this_year:
+            continue
+        prior = [d for d in dates if d < f"{y}0101"]
+        in_year = [d for d in dates if d[:4] == str(y)]
+        if not prior or not in_year:
+            continue
+        try:
+            out[str(y)] = E.build_series(ds_all, prior[-1], in_year[-1]).total() * 100
+        except Exception:
+            continue
+    return out
+
+
+def _run_incremental_sync(token: str, qid: str, state_path: str):
+    """Sincronización incremental manual: el mismo q4_sync.daily_job() que
+    usa el cron (q4_daily.py), disparado a mano — para quien no tiene el
+    disparador de launchd/cron instalado y quiere ponerse al día sin pedir
+    otra vez todo el histórico."""
+    from q4_ingest import FlexClient
+    from q4_sync import daily_job
+
+    lock_path = f"{state_path}.lock"
+    if os.path.exists(lock_path):
+        age = time.time() - os.path.getmtime(lock_path)
+        if age < LOCK_STALE_S:
+            st.error(f"Ya hay una sincronización en marcha para esta query "
+                     f"(empezó hace {int(age)}s). Espera a que termine.")
+            return
+
+    os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+    with open(lock_path, "w") as f:
+        f.write(str(time.time()))
+    try:
+        client = FlexClient(token=token, query_id=qid, raw_dir=RAW_DIR)
+        with st.status("Sincronizando desde el último día…", expanded=True) as status:
+            try:
+                status.write("Pidiendo el rango pendiente…")
+                res = daily_job(client, state_path, qid, _incremental_parse_fn,
+                                _incremental_recompute_fn)
+                if res["status"] == "ok":
+                    status.update(label="Sincronización completa", state="complete")
+                    wm = res.get("watermark", "")
+                    wm_fmt = (dt.datetime.strptime(wm, "%Y%m%d").strftime("%d/%m/%Y")
+                              if wm else "—")
+                    st.session_state.pop("paths", None)  # recargar de disco, no lo de la sesión
+                    st.success(f"Al día: {wm_fmt}. "
+                              f"{len(res.get('new_dates', []))} sesión(es) nueva(s).")
+                    if res.get("golden_drift"):
+                        st.warning("Los años cerrados han cambiado: " +
+                                  " · ".join(res["golden_drift"]))
+                elif res["status"] == "no_new_data":
+                    status.update(label="Ya estabas al día", state="complete")
+                    st.info("Sin sesiones nuevas — nada que traer.")
+                else:
+                    status.update(label="No se pudo sincronizar", state="error")
+                    st.error(res.get("reason", res["status"]))
+            except Exception as e:
+                status.update(label="Error en la sincronización", state="error")
+                st.error(str(e))
+    finally:
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+
+
+def _history_start_field(qid: str, license_mode: str) -> pd.Timestamp:
+    """"Importar histórico desde" — dentro del expander colapsable de
+    main() (igual que license_gate()/_connection_fields(): st.X, no
+    st.sidebar.X). El resto de lo relacionado con esto (aviso de qué fecha
+    quedó ya fijada, "Reanclar a otra fecha de inicio") se queda en
+    sidebar_source(), fuera del expander — Streamlit no permite anidar un
+    expander dentro de otro, y "Reanclar" ya es uno."""
+    from q4_sync import SyncState
+    state_path = os.path.join(RAW_DIR, f"state_{qid}.json")
+    existing_start = SyncState.load(state_path, qid).history_start if qid else ""
+
+    trial_floor = None
+    if license_mode == "trial":
+        trial_floor = (pd.Timestamp.today().normalize()
+                       - pd.DateOffset(months=TRIAL_MONTHS)).date()
+        st.caption(f"Modo de prueba: histórico limitado a los últimos "
+                  f"{TRIAL_MONTHS} meses (desde "
+                  f"{trial_floor.strftime('%d/%m/%Y')}). Con licencia "
+                  "activa se levanta el límite.")
+
+    default_start = pd.Timestamp(existing_start) if existing_start else pd.Timestamp("2023-01-01")
+    if trial_floor is not None:
+        default_start = max(default_start, pd.Timestamp(trial_floor))
+        return st.date_input("Importar histórico desde", default_start,
+                             min_value=trial_floor, format="DD/MM/YYYY")
+    return st.date_input("Importar histórico desde", default_start, format="DD/MM/YYYY")
+
+
+def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp) -> P.Dataset | None:
     from q4_sync import SyncState  # noqa: E402  (import local: sólo hace falta aquí)
 
     # Un fichero de estado POR QUERY (state_<queryId>.json), no uno solo
@@ -488,48 +663,57 @@ def sidebar_source(license_mode: str = "full") -> P.Dataset | None:
     # completo arranque antes.
     existing_start = SyncState.load(state_path, qid).history_start if qid else ""
 
-    # Modo de prueba (sin licencia activa, §license_gate): tope de
-    # TRIAL_MONTHS meses de histórico. Se impone con `min_value` en el
-    # `date_input` de más abajo — es el único punto por el que pasa tanto
-    # una query nueva (fija `state.history_start` la primera vez) como un
-    # reanclado (§"Reanclar a otra fecha de inicio"), así que basta con
-    # acotar ahí. No retroactivo: una query que YA tenía history_start más
-    # antiguo de una licencia anterior no se recorta sola — q4_sync.backfill
-    # nunca reduce una rejilla ya sembrada, sólo la extiende.
-    trial_floor = None
-    if license_mode == "trial":
-        trial_floor = (pd.Timestamp.today().normalize()
-                       - pd.DateOffset(months=TRIAL_MONTHS)).date()
-        st.sidebar.caption(f"Modo de prueba: histórico limitado a los últimos "
-                           f"{TRIAL_MONTHS} meses (desde "
-                           f"{trial_floor.strftime('%d/%m/%Y')}). Con licencia "
-                           "activa se levanta el límite.")
+    # Alerta del último día sincronizado + botón de sincronización
+    # incremental manual: el mismo q4_sync.daily_job() que ya usa el cron
+    # (q4_daily.py), pero disparado a mano — pide solo desde ese día hasta
+    # el último cierre disponible (con el solape de 10 días de siempre,
+    # §19.3), mucho más rápido que "Sincronizar" cuando ya se tiene el
+    # histórico y solo hace falta ponerse al día.
+    state_now = SyncState.load(state_path, qid) if qid else None
+    if state_now and not state_now.watermark and state_now.windows_done:
+        # Instalación existente que solo ha usado "Sincronizar" (nunca ha
+        # corrido q4_daily.py): sembrar el watermark desde lo ya
+        # descargado, igual que hace q4_daily.py en su primera ejecución —
+        # si no, esta sección nunca llegaría a aparecer.
+        try:
+            state_now.watermark = load_paths(
+                tuple(w[2] for w in state_now.windows_done)).dates[-1]
+            state_now.save(state_path)
+        except Exception:
+            pass
+    if state_now and state_now.watermark:
+        wm_d = dt.datetime.strptime(state_now.watermark, "%Y%m%d").date()
+        st.sidebar.info(f"Último día sincronizado: {wm_d.strftime('%d/%m/%Y')}.")
+        if st.sidebar.button("Sincronizar desde ese día", disabled=not (token and qid)):
+            _run_incremental_sync(token, qid, state_path)
+
+    # `start` ya viene calculado de _history_start_field(), dentro del
+    # expander "Conexión y licencia" (§main) — aquí solo se usa. La única
+    # razón para seguir sabiendo si hay modo de prueba es el aviso de más
+    # abajo, en el botón "Sincronizar".
+    trial_floor = ((pd.Timestamp.today().normalize() - pd.DateOffset(months=TRIAL_MONTHS)).date()
+                   if license_mode == "trial" else None)
 
     if existing_start:
         d = dt.datetime.strptime(existing_start, "%Y%m%d").date()
         st.sidebar.caption(f"La descarga arranca en {d.strftime('%d/%m/%Y')} "
                            "(primera sincronización de esta query; no cambia "
-                           "aunque pongas otra fecha aquí abajo). Lo que pongas "
-                           "sí decide qué parte se carga en el panel.")
+                           "aunque pongas otra fecha en «Importar histórico "
+                           "desde», arriba en «Conexión y licencia»). Lo que "
+                           "pongas ahí sí decide qué parte se carga en el panel.")
         with st.sidebar.expander("Reanclar a otra fecha de inicio"):
             st.caption("Borra el punto de partida y las ventanas descargadas "
                        "de ESTA query — no toca los XML ya guardados en "
                        "disco, sólo deja de usarlos. El próximo "
                        "'Sincronizar' vuelve a pedir el histórico completo "
-                       "desde cero, con la fecha que pongas abajo.")
+                       "desde cero, con la fecha de «Importar histórico "
+                       "desde».")
             confirm = st.checkbox("Confirmo que quiero reiniciar el "
                                   "histórico de esta query")
             if st.button("Reiniciar histórico", disabled=not confirm):
                 SyncState(query_id=qid).save(state_path)
                 st.session_state.pop("paths", None)
                 st.rerun()
-
-    default_start = pd.Timestamp(existing_start) if existing_start else pd.Timestamp("2023-01-01")
-    if trial_floor is not None:
-        default_start = max(default_start, pd.Timestamp(trial_floor))
-        start = st.sidebar.date_input("Histórico desde", default_start, min_value=trial_floor)
-    else:
-        start = st.sidebar.date_input("Histórico desde", default_start)
 
     if st.sidebar.button("Sincronizar", disabled=not (token and qid)):
         from q4_ingest import FlexClient, validate_query
@@ -1682,8 +1866,23 @@ def main():
         f'<h1 class="vf-title" style="font-size:60px">VeriFine '
         f'<span class="vf-tagline">| Audita tu cuenta de IBKR</span></h1></div>',
         unsafe_allow_html=True)
-    license_mode = license_gate()
-    ds = sidebar_source(license_mode)
+    st.sidebar.markdown(f'<div class="vf-brand">{svg("target", 22)}VeriFine</div>',
+                        unsafe_allow_html=True)
+
+    # Licencia/Token/Query ID/carpeta van en un bloque plegable — a
+    # petición expresa, para no ocupar sitio en el sidebar en cada visita
+    # una vez ya hay datos cargados. Plegado por defecto solo cuando YA hay
+    # extractos en el almacén (comprobación barata por fichero, antes de
+    # tocar nada de sesión); la primera vez, o tras "Borrar todo", se abre
+    # solo porque hace falta rellenarlo.
+    has_data = bool(glob.glob(os.path.join(RAW_DIR, "*.xml")))
+    with st.sidebar.expander("Conexión y licencia", expanded=not has_data):
+        license_mode = license_gate()
+        token, qid = _connection_fields()
+        start = _history_start_field(qid, license_mode)
+        _danger_zone()
+
+    ds = sidebar_source(license_mode, token, qid, start)
     if ds is None:
         configuracion_view()
         st.stop()

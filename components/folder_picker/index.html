@@ -100,9 +100,34 @@ de Python a esta carpeta), que necesita este puente ya construido primero.
     setValue({supported: false, picked: false});
   }
 
-  send({type: "streamlit:componentReady", apiVersion: 1});
-  setHeight();
-  window.addEventListener("load", setHeight);
+  function announce() {
+    send({type: "streamlit:componentReady", apiVersion: 1});
+    setHeight();
+  }
+
+  // Streamlit manda un mensaje "streamlit:render" a este iframe en CADA
+  // rerun (cualquier clic en cualquier widget de la app, no solo aquí).
+  // Reaccionar a eso, y no solo anunciarse una vez al cargar, es lo que de
+  // verdad soluciona que el componente se quede invisible tras varias
+  // interacciones: si el primer "componentReady" no llegó a tiempo al
+  // registro del lado de Streamlit (visto en pruebas: mensajes recibidos
+  // como "unregistered ComponentInstance"), el siguiente render vuelve a
+  // darle ocasión de registrarse — sin esto, quedaba invisible hasta
+  // recargar la página entera a mano.
+  window.addEventListener("message", (event) => {
+    if (event.data && event.data.type === "streamlit:render") announce();
+  });
+
+  announce();
+  window.addEventListener("load", announce);
+  // Red de seguridad adicional por si el primer intercambio se pierde del
+  // todo (sin ningún "render" posterior que lo dispare): un par de
+  // reintentos cortos tras cargar, luego se para — no hace falta más.
+  let retries = 0;
+  const retryTimer = setInterval(() => {
+    announce();
+    if (++retries >= 5) clearInterval(retryTimer);
+  }, 800);
 </script>
 </body>
 </html>

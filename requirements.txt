@@ -1,4 +1,10 @@
-streamlit>=1.40
+# Fijada a la versión exacta que corre en local (antes >=1.40 sin techo):
+# varios fallos visuales en Streamlit Cloud (fondo blanco en inputs/botón/
+# tablas, rojo por defecto en vez de nuestro verde) no se reproducían en
+# local — la sospecha es que Cloud puede resolver una versión distinta a
+# la instalada aquí. Fijarla elimina esa variable; si el problema persiste
+# tras redesplegar, no era la versión.
+streamlit==1.50.0
 pandas>=2.0
 numpy>=1.24
 plotly>=5.20
