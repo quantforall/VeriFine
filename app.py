@@ -276,6 +276,16 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
 .vf-kv-item .v {{ font-family:'Fira Code',monospace; font-weight:600; }}
 .vf-kv-item .v.attn {{ color:{BENCH}; }}
 
+/* Oculta el menú "☰" (arriba a la derecha): ahí vive el selector de tema
+   de Streamlit (Settings → Theme), y el resto de la app da por hecho el
+   tema OLED — si alguien cambia a claro desde ese menú, todo lo que NO
+   está en las clases vf-* (sidebar nativo, inputs, tablas) se vuelve claro
+   y choca con las tarjetas/CSS a medida, que siguen fijas en oscuro. Más
+   fiable que confiar en que nadie toque el menú: quitarlo. Reforzado en
+   .streamlit/config.toml con [client] toolbarMode = "minimal" (ese sí
+   necesita reiniciar el proceso, como cualquier cambio de config.toml). */
+[data-testid="stMainMenu"], #MainMenu {{ visibility:hidden; }}
+
 @media (prefers-reduced-motion: reduce) {{
   * {{ transition:none !important; animation:none !important; }}
 }}
