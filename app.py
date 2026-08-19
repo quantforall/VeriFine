@@ -357,6 +357,30 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
   background-color: var(--pos) !important;
 }}
 
+/* Mismo patrón otra vez, ahora en la CABECERA de un expander (el "▷
+   Conexión y licencia" plegable): reportado en el móvil, la barra entera
+   sale en blanco con el texto casi invisible — el fondo oscuro no llega
+   al <summary> nativo. st.expander usa <details>/<summary>; el <summary>
+   no tiene su propio data-testid, así que va por descendiente dentro de
+   stExpander (sí lo tiene). */
+[data-testid="stExpander"] summary {{
+  background-color: var(--card) !important;
+  color: var(--fg) !important;
+}}
+[data-testid="stExpander"] summary:hover {{
+  background-color: var(--panel) !important;
+}}
+[data-testid="stExpander"] summary svg {{
+  color: var(--fg) !important;
+}}
+/* El propio <details> (el cuerpo desplegado) y stExpanderDetails, mismo
+   motivo que el resto de contenedores nativos de más arriba. */
+[data-testid="stExpander"] details,
+[data-testid="stExpanderDetails"] {{
+  background-color: var(--card) !important;
+  border-color: var(--border) !important;
+}}
+
 @media (prefers-reduced-motion: reduce) {{
   * {{ transition:none !important; animation:none !important; }}
 }}
