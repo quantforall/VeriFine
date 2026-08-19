@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.verifine.daily</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Developer/CommandLineTools/usr/bin/python3</string>
+        <string>/Users/juan/Desktop/VeriFine/q4_daily.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/juan/Desktop/VeriFine</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>Q4_RAW_DIR</key>
+        <string>/Users/juan/Desktop/VeriFine/raw</string>
+    </dict>
+
+    <!-- Media mañana CET recoge con margen el cierre US de la víspera (§19.8). -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>10</integer>
+        <key>Minute</key><integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/juan/Desktop/VeriFine/raw/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/juan/Desktop/VeriFine/raw/launchd.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

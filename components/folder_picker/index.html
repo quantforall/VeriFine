@@ -1,0 +1,108 @@
+<!--
+VeriFine — componente a medida: "elige dónde vive el dato" (Camino A, fase
+local). Protocolo crudo de Streamlit Components (postMessage, sin
+streamlit-component-lib ni build): componentReady / setFrameHeight /
+setComponentValue. Sin esto no hay forma de que Python se entere de qué
+eligió el navegador — showDirectoryPicker() vive solo del lado JS, Python
+nunca ve el handle, sólo lo que este fichero decide contarle.
+
+Alcance de HOY (fase local, app aún no desplegada): solo confirma qué
+carpeta eligió el usuario y si su navegador soporta elegirla de verdad. NO
+escribe todavía los extractos ahí — eso es el paso siguiente (llevar bytes
+de Python a esta carpeta), que necesita este puente ya construido primero.
+-->
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@600&family=Fira+Sans:wght@400;500;600&display=swap');
+  :root {
+    --bg: #0E1223; --border: #334155; --fg: #F8FAFC; --muted: #94A3B8;
+    --pos: #22C55E; --pos-dim: rgba(34,197,94,.12);
+    --series: #38BDF8; --series-dim: rgba(56,189,248,.08);
+    --bench: #F59E0B; --bench-dim: rgba(245,158,11,.08);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2px 0; background: transparent; color: var(--fg);
+    font-family: 'Fira Sans', system-ui, sans-serif; font-size: 13.5px;
+  }
+  .box {
+    display: flex; gap: 10px; align-items: flex-start; border-radius: 8px;
+    padding: 11px 13px; border: 1px solid; margin-bottom: 8px;
+  }
+  .box.series { background: var(--series-dim); border-color: rgba(56,189,248,.35); }
+  .box.bench { background: var(--bench-dim); border-color: rgba(245,158,11,.35); }
+  .box svg { flex: none; margin-top: 1px; }
+  .box.series svg { color: var(--series); }
+  .box.bench svg { color: var(--bench); }
+  .box p { margin: 0; line-height: 1.4; }
+  button {
+    font-family: 'Fira Sans', sans-serif; font-weight: 600; font-size: 13px;
+    background: transparent; color: var(--fg); border: 1px solid var(--border);
+    border-radius: 7px; padding: 8px 14px; cursor: pointer;
+  }
+  button:hover { border-color: #475569; }
+  button:disabled { opacity: .5; cursor: default; }
+  .confirm {
+    font-family: 'Fira Code', monospace; font-size: 12.5px; color: var(--pos);
+    background: var(--pos-dim); border: 1px solid rgba(34,197,94,.35);
+    border-radius: 7px; padding: 8px 12px; margin-top: 8px; display: none;
+  }
+</style>
+</head>
+<body>
+  <div id="chromium" class="box series" style="display:none">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+    <p>Elige una carpeta en tu ordenador. Ahí se guardarán tus extractos como
+    archivos normales — puedes verlos, moverlos, respaldarlos.
+    <br><button id="pick">Elegir carpeta…</button>
+    <div id="confirm" class="confirm"></div></p>
+  </div>
+  <div id="fallback" class="box bench" style="display:none">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+    <p>Este navegador no deja elegir carpeta (solo Chrome, Edge y Opera lo
+    soportan). Tus datos seguirán guardándose igual, pero VeriFine decide
+    dónde en vez de tú.</p>
+  </div>
+
+<script>
+  // --- protocolo crudo de Streamlit Components (sin streamlit-component-lib) ---
+  function send(payload) {
+    window.parent.postMessage(Object.assign({isStreamlitMessage: true}, payload), "*");
+  }
+  function setValue(value) {
+    send({type: "streamlit:setComponentValue", value: value, dataType: "json"});
+  }
+  function setHeight() {
+    send({type: "streamlit:setFrameHeight", height: document.body.scrollHeight});
+  }
+
+  const supported = "showDirectoryPicker" in window;
+  document.getElementById(supported ? "chromium" : "fallback").style.display = "flex";
+
+  if (supported) {
+    document.getElementById("pick").addEventListener("click", async () => {
+      try {
+        const handle = await window.showDirectoryPicker();
+        const box = document.getElementById("confirm");
+        box.textContent = "✓ Carpeta elegida: " + handle.name;
+        box.style.display = "block";
+        setValue({supported: true, picked: true, name: handle.name});
+        setHeight();
+      } catch (e) {
+        // AbortError: el usuario cerró el selector sin elegir — no es un error real.
+        if (e.name !== "AbortError") setValue({supported: true, picked: false, error: String(e)});
+      }
+    });
+  } else {
+    setValue({supported: false, picked: false});
+  }
+
+  send({type: "streamlit:componentReady", apiVersion: 1});
+  setHeight();
+  window.addEventListener("load", setHeight);
+</script>
+</body>
+</html>
