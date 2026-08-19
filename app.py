@@ -286,6 +286,37 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
    necesita reiniciar el proceso, como cualquier cambio de config.toml). */
 [data-testid="stMainMenu"], #MainMenu {{ visibility:hidden; }}
 
+/* Streamlit Cloud (comprobado en vivo en verifine.streamlit.app, distinto
+   de lo que se ve en local) NO pinta el fondo oscuro en el CONTENEDOR de
+   varios widgets pese a base="dark" en config.toml — probable diferencia
+   de versión de Streamlit entre local y Cloud. Confirmado por CSS
+   computada: stTextInputRootElement y stDateInputField salían en blanco
+   puro (255,255,255) con el texto ya en color de tema oscuro (casi
+   blanco) — blanco sobre blanco, invisible; stBaseButton-secondary casi
+   igual. Se fuerza aquí en vez de fiarse del motor de temas de Streamlit.
+   [data-baseweb=...] son los atributos que BaseWeb (la librería de
+   componentes que usa Streamlit) pone en el contenedor de cada widget —
+   cubre inputs/selects aunque cambien el data-testid entre versiones. */
+[data-testid="stTextInputRootElement"],
+[data-testid="stDateInputField"],
+[data-testid="stNumberInputField"],
+[data-testid="stSelectboxRootElement"],
+[data-testid="stMultiSelectRootElement"],
+[data-baseweb="input"], [data-baseweb="base-input"],
+[data-baseweb="select"], [data-baseweb="textarea"] {{
+  background-color: var(--card) !important;
+  border-color: var(--border) !important;
+}}
+[data-testid="stBaseButton-secondary"] {{
+  background-color: var(--card) !important;
+  border-color: var(--border) !important;
+  color: var(--fg) !important;
+}}
+[data-testid="stBaseButton-secondary"]:hover {{
+  background-color: var(--panel) !important;
+  border-color: #475569 !important;
+}}
+
 @media (prefers-reduced-motion: reduce) {{
   * {{ transition:none !important; animation:none !important; }}
 }}
