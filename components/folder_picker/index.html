@@ -6,10 +6,16 @@ setComponentValue. Sin esto no hay forma de que Python se entere de qué
 eligió el navegador — showDirectoryPicker() vive solo del lado JS, Python
 nunca ve el handle, sólo lo que este fichero decide contarle.
 
-Alcance de HOY (fase local, app aún no desplegada): solo confirma qué
-carpeta eligió el usuario y si su navegador soporta elegirla de verdad. NO
-escribe todavía los extractos ahí — eso es el paso siguiente (llevar bytes
-de Python a esta carpeta), que necesita este puente ya construido primero.
+Las tres fases del plan de persistencia en el navegador: confirma qué
+carpeta eligió el usuario, escribe ahí los ficheros que Python le mande
+(arg `files_to_write`, tras cada sincronización) con la File System
+Access API, recuerda el `handle` ENTRE SESIONES en IndexedDB — el permiso
+de acceso hay que reconfirmarlo (nunca se recuerda solo, por seguridad
+del navegador), pero eso es un clic ligero ("Confirmar acceso"), no
+volver a elegir la carpeta entera — y, si Python arranca sin datos (arg
+`want_restore`, contenedor efímero de Streamlit Cloud reiniciado), le
+devuelve lo que haya en la carpeta ANTES de que la app compruebe qué
+falta contra IBKR.
 -->
 <!doctype html>
 <html lang="es">
@@ -37,7 +43,7 @@ de Python a esta carpeta), que necesita este puente ya construido primero.
   .box svg { flex: none; margin-top: 1px; }
   .box.series svg { color: var(--series); }
   .box.bench svg { color: var(--bench); }
-  .box p { margin: 0; line-height: 1.4; }
+  .box p { margin: 0 0 8px; line-height: 1.4; }
   button {
     font-family: 'Fira Sans', sans-serif; font-weight: 600; font-size: 13px;
     background: transparent; color: var(--fg); border: 1px solid var(--border);
@@ -55,10 +61,19 @@ de Python a esta carpeta), que necesita este puente ya construido primero.
 <body>
   <div id="chromium" class="box series" style="display:none">
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-    <p>Elige una carpeta en tu ordenador. Ahí se guardarán tus extractos como
-    archivos normales — puedes verlos, moverlos, respaldarlos.
-    <br><button id="pick">Elegir carpeta…</button>
-    <div id="confirm" class="confirm"></div></p>
+    <div>
+      <!-- #chromium-text es un <p> aparte, NO el padre de los botones: el
+      código de la fase 2 le reescribe el textContent (mensajes de "carpeta
+      recordada, confirma el acceso"), y eso BORRA cualquier hijo que tuviera
+      dentro — con los botones anidados aquí como antes, ese mismo
+      reescribido los eliminaba del DOM sin querer (confirmado: getElementById
+      volvía null tras la reescritura). Como hermanos, sobreviven. -->
+      <p id="chromium-text">Elige una carpeta en tu ordenador. Ahí se guardarán tus extractos
+      como archivos normales — puedes verlos, moverlos, respaldarlos.</p>
+      <button id="pick">Elegir carpeta…</button>
+      <button id="confirm-access" style="display:none">Confirmar acceso</button>
+      <div id="confirm" class="confirm"></div>
+    </div>
   </div>
   <div id="fallback" class="box bench" style="display:none">
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
@@ -82,20 +97,189 @@ de Python a esta carpeta), que necesita este puente ya construido primero.
   const supported = "showDirectoryPicker" in window;
   document.getElementById(supported ? "chromium" : "fallback").style.display = "flex";
 
-  if (supported) {
-    document.getElementById("pick").addEventListener("click", async () => {
+  let folderHandle = null;  // vive mientras este iframe siga montado (§docstring arriba)
+
+  // base64 -> Uint8Array. atob() ya viene en el navegador, no hace falta
+  // ninguna librería para esto.
+  function b64ToBytes(b64) {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+
+  // Uint8Array -> base64, en trozos: String.fromCharCode.apply con un
+  // array entero grande revienta la pila de llamadas (visto en la práctica
+  // con extractos de varios MB) — de 32 KiB en 32 KiB no hay límite real.
+  function bytesToB64(bytes) {
+    let binary = "";
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  }
+
+  async function writeFiles(files) {
+    let wrote = 0;
+    const errors = [];
+    for (const f of files) {
       try {
-        const handle = await window.showDirectoryPicker();
-        const box = document.getElementById("confirm");
-        box.textContent = "✓ Carpeta elegida: " + handle.name;
-        box.style.display = "block";
-        setValue({supported: true, picked: true, name: handle.name});
-        setHeight();
+        const fh = await folderHandle.getFileHandle(f.name, {create: true});
+        const w = await fh.createWritable();
+        await w.write(b64ToBytes(f.content_b64));
+        await w.close();
+        wrote++;
       } catch (e) {
-        // AbortError: el usuario cerró el selector sin elegir — no es un error real.
-        if (e.name !== "AbortError") setValue({supported: true, picked: false, error: String(e)});
+        errors.push(`${f.name}: ${e.message}`);
+      }
+    }
+    setValue({supported: true, picked: true, name: folderHandle.name,
+             wrote, total: files.length, errors});
+  }
+
+  // --- Paso 3/3: restaurar al entrar -------------------------------------
+  // El contenedor de Streamlit Cloud es efímero — puede reiniciarse entre
+  // sesiones y perder RAW_DIR entero aunque el usuario nunca haya borrado
+  // nada. Si Python arranca sin datos (arg `want_restore`) y el navegador
+  // ya tiene la carpeta con el permiso confirmado, le devolvemos lo que
+  // haya ahí (extractos .xml y el fichero de estado state_*.json) ANTES de
+  // que la app se ponga a comprobar qué falta contra IBKR — así no hace
+  // falta volver a descargar todo el histórico solo porque el servidor se
+  // reinició.
+  let wantRestore = false;   // lo pone Python vía args, ver el listener de "message" más abajo
+  let restoreSent = false;   // una vez por carga de página — no reenviar en cada rerun
+
+  async function readAllForRestore() {
+    const files = [];
+    for await (const [name, handle] of folderHandle.entries()) {
+      if (handle.kind !== "file") continue;
+      // mismo patrón que escribe _queue_folder_write() en app.py: extractos
+      // .xml y el fichero de estado state_<qid>.json — nunca .license.json
+      // ni .ibkr_credentials, que jamás llegan a esta carpeta.
+      if (!(name.endsWith(".xml") || (name.startsWith("state_") && name.endsWith(".json")))) continue;
+      try {
+        const file = await handle.getFile();
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        files.push({name, content_b64: bytesToB64(bytes)});
+      } catch (e) { /* un fichero ilegible no debe tumbar el resto */ }
+    }
+    return files;
+  }
+
+  async function maybeRestore() {
+    if (!folderHandle || !wantRestore || restoreSent) return;
+    restoreSent = true;
+    const files = await readAllForRestore();
+    if (files.length) {
+      setValue({supported: true, picked: true, name: folderHandle.name, restored_files: files});
+    }
+  }
+
+  // --- Paso 2/3: recordar el permiso de la carpeta ENTRE sesiones -------
+  // Un FileSystemDirectoryHandle es "structured-cloneable": se puede meter
+  // tal cual en IndexedDB y sacarlo intacto en una visita futura. El
+  // permiso de acceso NO se recuerda solo — hay que volver a pedirlo
+  // (queryPermission/requestPermission), pero eso es un permiso ligero
+  // del navegador, no el selector de carpeta entero: el usuario elige la
+  // carpeta UNA vez, no en cada visita.
+  const DB_NAME = "verifine-folder", STORE = "handles", KEY = "folder";
+
+  function openDb() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(DB_NAME, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore(STORE);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  async function saveHandle(handle) {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, "readwrite");
+      tx.objectStore(STORE).put(handle, KEY);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+  async function loadHandle() {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const req = db.transaction(STORE, "readonly").objectStore(STORE).get(KEY);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  function showConfirmed(handle, restored) {
+    const box = document.getElementById("confirm");
+    box.textContent = (restored ? "✓ Carpeta recordada: " : "✓ Carpeta elegida: ") + handle.name;
+    box.style.display = "block";
+    document.getElementById("pick").style.display = "none";
+    document.getElementById("confirm-access").style.display = "none";
+    setValue({supported: true, picked: true, name: handle.name, restored: !!restored});
+    setHeight();
+    // Punto único donde folderHandle acaba de quedar utilizable, venga de
+    // donde venga (recordada en silencio, confirmada con clic, o recién
+    // elegida) — de aquí cuelga la fase 3, ver su bloque más arriba.
+    maybeRestore();
+  }
+
+  async function pickNewFolder() {
+    try {
+      folderHandle = await window.showDirectoryPicker();
+      await saveHandle(folderHandle);
+      showConfirmed(folderHandle, false);
+    } catch (e) {
+      // AbortError: el usuario cerró el selector sin elegir — no es un error real.
+      if (e.name !== "AbortError") setValue({supported: true, picked: false, error: String(e)});
+    }
+  }
+
+  if (supported) {
+    document.getElementById("pick").addEventListener("click", pickNewFolder);
+    document.getElementById("confirm-access").addEventListener("click", async () => {
+      // requestPermission() SÍ exige un gesto real del usuario (este
+      // clic) — por eso no se llama sola nada más cargar la página.
+      const stored = await loadHandle().catch(() => null);
+      if (!stored) return;
+      let perm = "denied";
+      try { perm = await stored.requestPermission({mode: "readwrite"}); } catch (e) { /* queda "denied" */ }
+      if (perm === "granted") {
+        folderHandle = stored;
+        showConfirmed(stored, true);
+      } else {
+        // Sin esto el usuario se queda sin NINGÚN botón visible (confirmado
+        // en pruebas): hay que devolverle la vía de "elegir carpeta" que el
+        // texto le está ofreciendo, no solo esconder la que falló.
+        document.getElementById("chromium-text").textContent =
+          "No se pudo confirmar el acceso a la carpeta guardada — elige una de nuevo.";
+        document.getElementById("confirm-access").style.display = "none";
+        document.getElementById("pick").style.display = "inline-block";
+        setHeight();
       }
     });
+
+    // Al cargar: si ya hay una carpeta guardada de una visita anterior,
+    // comprobar el permiso SIN pedirlo (queryPermission no exige gesto).
+    // Si ya está concedido, restaurar sola; si no, ofrecer el botón de
+    // confirmar en vez del de elegir — sigue sin hacer falta re-elegir.
+    (async () => {
+      const stored = await loadHandle().catch(() => null);
+      if (!stored) return;
+      let perm = "denied";
+      try { perm = await stored.queryPermission({mode: "readwrite"}); } catch (e) { /* queda "denied" */ }
+      if (perm === "granted") {
+        folderHandle = stored;
+        showConfirmed(stored, true);
+      } else {
+        document.getElementById("chromium-text").textContent =
+          "Ya conoces la carpeta «" + stored.name + "» de antes — confirma el acceso.";
+        document.getElementById("pick").style.display = "none";
+        document.getElementById("confirm-access").style.display = "inline-block";
+        setHeight();
+      }
+    })();
   } else {
     setValue({supported: false, picked: false});
   }
@@ -106,16 +290,29 @@ de Python a esta carpeta), que necesita este puente ya construido primero.
   }
 
   // Streamlit manda un mensaje "streamlit:render" a este iframe en CADA
-  // rerun (cualquier clic en cualquier widget de la app, no solo aquí).
-  // Reaccionar a eso, y no solo anunciarse una vez al cargar, es lo que de
-  // verdad soluciona que el componente se quede invisible tras varias
-  // interacciones: si el primer "componentReady" no llegó a tiempo al
-  // registro del lado de Streamlit (visto en pruebas: mensajes recibidos
-  // como "unregistered ComponentInstance"), el siguiente render vuelve a
-  // darle ocasión de registrarse — sin esto, quedaba invisible hasta
-  // recargar la página entera a mano.
+  // rerun (cualquier clic en cualquier widget de la app, no solo aquí), con
+  // los argumentos actuales en event.data.args. Reaccionar a eso, y no solo
+  // anunciarse una vez al cargar, es lo que de verdad soluciona que el
+  // componente se quede invisible tras varias interacciones: si el primer
+  // "componentReady" no llegó a tiempo al registro del lado de Streamlit
+  // (visto en pruebas: mensajes recibidos como "unregistered
+  // ComponentInstance"), el siguiente render vuelve a darle ocasión de
+  // registrarse — sin esto, quedaba invisible hasta recargar la página
+  // entera a mano. Ese mismo evento es también cómo llegan los ficheros
+  // nuevos a escribir tras cada sincronización (fase "guardar al salir").
   window.addEventListener("message", (event) => {
-    if (event.data && event.data.type === "streamlit:render") announce();
+    if (!(event.data && event.data.type === "streamlit:render")) return;
+    announce();
+    const args = event.data.args || {};
+    const files = args.files_to_write;
+    if (files && files.length && folderHandle) writeFiles(files);
+    // Python pone want_restore=true mientras RAW_DIR siga vacío en el
+    // servidor. folderHandle puede llegar a estar listo ANTES de que este
+    // primer "render" traiga los args (recuerdo en silencio, ver el IIFE
+    // de arriba) — por eso maybeRestore() también se llama desde aquí, no
+    // solo desde showConfirmed().
+    wantRestore = !!args.want_restore;
+    maybeRestore();
   });
 
   announce();

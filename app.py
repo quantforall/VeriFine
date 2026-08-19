@@ -18,6 +18,7 @@ import json
 import time
 import glob
 import shutil
+import base64
 import datetime as dt
 
 import pandas as pd
@@ -510,6 +511,30 @@ def load_paths(paths: tuple[str, ...]) -> P.Dataset:
     return P.load(list(paths))
 
 
+def _queue_folder_write(paths: list[str], state_path: str) -> None:
+    """Encola ficheros para que _connection_fields() se los pase al
+    componente de carpeta en el PRÓXIMO rerun (Camino A, fase "guardar al
+    salir", 1 de 3 — ver components/folder_picker/index.html). Incluye
+    siempre el estado de sincronización además de los XML, para que una
+    futura restauración (fase 3) tenga también windows_done/watermark, no
+    solo los extractos.
+
+    Si el usuario no ha elegido carpeta (o su navegador no la soporta,
+    Safari/Firefox), el componente ignora esto sin más — RAW_DIR en el
+    servidor sigue siendo la copia real, esto es solo una copia de más."""
+    files = []
+    for p in paths + ([state_path] if os.path.exists(state_path) else []):
+        try:
+            with open(p, "rb") as f:
+                files.append({"name": os.path.basename(p),
+                             "content_b64": base64.b64encode(f.read()).decode("ascii")})
+        except OSError:
+            continue
+    if files:
+        existing = st.session_state.get("_pending_folder_writes", [])
+        st.session_state["_pending_folder_writes"] = existing + files
+
+
 def _connection_fields() -> tuple[str, str]:
     """Token, Query ID, "Recordar" y el selector de carpeta. Se llama DENTRO
     del expander colapsable de main() (igual que license_gate(), ver su
@@ -532,11 +557,71 @@ def _connection_fields() -> tuple[str, str]:
     elif saved_token or saved_qid:
         _clear_ibkr_creds()
 
-    picker = _folder_picker(key="folder_picker")
+    # "files_to_write" solo va en la llamada si hay algo pendiente (§
+    # _queue_folder_write, encolado tras la última sincronización) — sin
+    # esto, el componente reenviaría los mismos ficheros en cada rerun.
+    picker_kwargs = {"key": "folder_picker"}
+    pending = st.session_state.pop("_pending_folder_writes", None)
+    if pending:
+        picker_kwargs["files_to_write"] = pending
+
+    # Fase 3 (restaurar al entrar): mientras el servidor no tenga extractos
+    # — contenedor efímero de Streamlit Cloud recién reiniciado, o primera
+    # carga de esta sesión — le pedimos al navegador lo que tenga guardado
+    # en la carpeta recordada. Ver want_restore en components/folder_picker/
+    # index.html.
+    picker_kwargs["want_restore"] = not bool(glob.glob(os.path.join(RAW_DIR, "*.xml")))
+
+    picker = _folder_picker(**picker_kwargs)
     if picker and picker.get("picked"):
         st.session_state["chosen_folder_name"] = picker["name"]
+    if picker and picker.get("wrote") is not None:
+        if picker["wrote"] > 0:
+            st.caption(f"✓ Copia guardada en tu carpeta: "
+                      f"{picker['wrote']}/{picker.get('total', picker['wrote'])} fichero(s).")
+        if picker.get("errors"):
+            st.caption("⚠ Algunos no se pudieron guardar: " +
+                      "; ".join(picker["errors"][:3]))
+    if picker and picker.get("restored_files"):
+        _restore_from_folder(picker["restored_files"])
 
     return token, qid
+
+
+def _restore_from_folder(files: list[dict]) -> None:
+    """Fase 3/3 de Camino A: escribe en RAW_DIR lo que el navegador acaba de
+    leer de la carpeta recordada (ver readAllForRestore() en
+    components/folder_picker/index.html) — solo llega cuando el servidor
+    empezó sin datos Y el navegador ya tenía carpeta con permiso confirmado.
+
+    Guarda de sesión obligatoria: Streamlit NO limpia el valor devuelto por
+    un componente entre reruns — sin `_restore_done`, el siguiente rerun
+    (el que provoca el propio st.rerun() de aquí abajo) volvería a ver el
+    mismo `restored_files` y reintentaría para siempre."""
+    if st.session_state.get("_restore_done"):
+        return
+    st.session_state["_restore_done"] = True
+    os.makedirs(RAW_DIR, exist_ok=True)
+    written = 0
+    for f in files:
+        name = f.get("name", "")
+        # Nombres inesperados (rutas, ocultos) nunca deberían llegar —
+        # readAllForRestore() ya filtra por patrón, esto es cinturón y
+        # tirantes contra escribir fuera de RAW_DIR.
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            continue
+        dest = os.path.join(RAW_DIR, name)
+        if os.path.exists(dest):
+            continue  # no pisar nada que el servidor ya tenga
+        try:
+            with open(dest, "wb") as fh:
+                fh.write(base64.b64decode(f["content_b64"]))
+            written += 1
+        except (OSError, KeyError, ValueError, TypeError):
+            continue
+    if written:
+        st.toast(f"↺ Restaurados {written} fichero(s) desde tu carpeta.", icon="✅")
+        st.rerun()
 
 
 def _danger_zone():
@@ -623,6 +708,9 @@ def _run_incremental_sync(token: str, qid: str, state_path: str):
                     if res.get("golden_drift"):
                         st.warning("Los años cerrados han cambiado: " +
                                   " · ".join(res["golden_drift"]))
+                    if res.get("raw_path"):
+                        _queue_folder_write([res["raw_path"]], state_path)
+                        st.rerun()  # sin esto, el fichero no llega al componente hasta el próximo clic
                 elif res["status"] == "no_new_data":
                     status.update(label="Ya estabas al día", state="complete")
                     st.info("Sin sesiones nuevas — nada que traer.")
@@ -830,6 +918,10 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
                                   expanded=True)
                     st.success(f"Listo: {fetched} bloque(s) nuevo(s) · "
                               f"{len(paths)} extractos cargados en el panel.")
+                    if fetched:
+                        new_paths = [w[2] for w in state.windows_done[before_n:]]
+                        _queue_folder_write(new_paths, state_path)
+                        st.rerun()  # sin esto, no llega al componente hasta el próximo clic
                 except Exception as e:
                     status.update(label="Error en la sincronización", state="error",
                                   expanded=True)
@@ -1308,7 +1400,16 @@ def benchmark_section(strat_series: E.Series, rf: float, tickers: list[str]):
 
 def style(df: pd.DataFrame, signed: list[str]):
     """Formatea las columnas numéricas; las 'signed' llevan signo explícito (+/−)
-    ADEMÁS del color verde/rojo, para no depender sólo del color."""
+    ADEMÁS del color verde/rojo, para no depender sólo del color.
+
+    El fondo/color base (antes de los verde/rojo por columna) se fuerza
+    aquí a propósito: st.dataframe pinta las celdas en un <canvas>
+    (glide-data-grid) que en Streamlit Cloud no coge el tema oscuro de
+    config.toml — pero SÍ respeta `background-color` puesto vía
+    pandas.Styler (`background` a secas, no; confirmado contra el propio
+    repo de Streamlit). Como las 7 tablas de la app pasan por esta función,
+    arreglarlo aquí las arregla todas a la vez, sin depender del motor de
+    temas de Streamlit."""
     num = [c for c in df.columns if df[c].dtype.kind == "f"]
 
     def fmt(col):
@@ -1316,7 +1417,8 @@ def style(df: pd.DataFrame, signed: list[str]):
             return lambda v: "—" if pd.isna(v) else f"{v:+,.2f}"
         return lambda v: "—" if pd.isna(v) else f"{v:,.2f}"
 
-    sty = df.style.format({c: fmt(c) for c in num})
+    sty = (df.style.format({c: fmt(c) for c in num})
+           .set_properties(**{"background-color": CARD, "color": FG}))
     for c in signed:
         if c in df.columns:
             sty = sty.map(lambda v: "" if pd.isna(v) else
