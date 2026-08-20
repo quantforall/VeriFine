@@ -110,13 +110,26 @@ THEME_CSS = f"""
   --color-neutral:{FG}; --ring:#FFFFFF;
 }}
 
-.stApp {{ background: var(--bg); }}
+/* !important en estas reglas base a propósito, no por costumbre: hasta
+   ahora coincidían por casualidad con los colores puestos en
+   config.toml (incluso sin forzarlas, "ganaban" porque ambos valores
+   eran el mismo hex) — al quitar esos colores personalizados de
+   config.toml (experimento del tema de fábrica, ver su cabecera) quedó
+   al descubierto que [data-testid="stSidebar"] en concreto SÍ tiene una
+   regla nativa de Streamlit más específica que la nuestra: sin
+   !important el sidebar se quedaba con el gris de fábrica de Streamlit
+   en vez de nuestro --panel. Con !important, nuestro CSS manda siempre,
+   tenga Streamlit puestos colores personalizados o no. */
+.stApp {{ background: var(--bg) !important; }}
 html, body, [data-testid="stAppViewContainer"], .stMarkdown, p, span, label, div {{
   font-family: 'Fira Sans', system-ui, sans-serif;
-  color: var(--fg);
+  color: var(--fg) !important;
 }}
 h1, h2, h3, h4, [data-testid="stMetricValue"] {{ font-family: 'Fira Code', ui-monospace, monospace; }}
-[data-testid="stSidebar"] {{ background: var(--panel); border-right: 1px solid var(--border); }}
+[data-testid="stSidebar"] {{
+  background: var(--panel) !important;
+  border-right: 1px solid var(--border) !important;
+}}
 
 /* cifras financieras siempre tabulares para evitar layout shift */
 .vf-value, [data-testid="stMetricValue"], [data-testid="stDataFrame"], .stDataFrame,
@@ -732,26 +745,40 @@ def _connection_fields() -> tuple[str, str]:
     picker = _folder_picker(**picker_kwargs)
     if picker and picker.get("picked"):
         st.session_state["chosen_folder_name"] = picker["name"]
-        # La carpeta se acaba de confirmar (elegida, recordada o
-        # reconfirmada) en ESTA sesión de navegador por primera vez: copia
-        # también TODO lo que el servidor ya tuviera de antes, no solo lo
-        # que se descargue de aquí en adelante — así "Elegir carpeta" dejar
-        # la carpeta al día con el histórico completo, tal y como se pidió.
-        # Sin `qid` el nombre del fichero de estado no se puede componer
-        # todavía; se reintenta en el siguiente rerun (picker.get("picked")
-        # se queda en True indefinidamente — Streamlit no limpia el valor
-        # de un componente entre reruns — así que esto no se pierde).
-        if qid and not st.session_state.get("_folder_seeded"):
-            st.session_state["_folder_seeded"] = True
-            existing = sorted(glob.glob(os.path.join(RAW_DIR, "*.xml")))
-            if existing:
-                state_path = os.path.join(RAW_DIR, f"state_{qid}.json")
-                _queue_folder_write(existing, state_path)
+        # La carpeta confirmada es un ESPEJO de RAW_DIR, no solo de lo
+        # nuevo: en cada rerun (cualquier clic en cualquier sitio de la
+        # app, no hace falta que sea aquí) se compara la lista actual de
+        # RAW_DIR contra la última que se mandó a la carpeta EN ESTA
+        # SESIÓN, y si ha cambiado se reenvía TODA la lista otra vez.
+        #
+        # Antes esto era un envío de una sola vez (una bandera de sesión):
+        # si esa única entrega se perdía — la sincronización termina bien
+        # en el servidor pero el st.rerun() que la lleva al componente cae
+        # sobre una conexión ya muerta por una espera larga a IBKR (visto
+        # en la práctica: Juan recargó la página y los extractos SÍ
+        # estaban en RAW_DIR, pero nunca llegaron a la carpeta) — no había
+        # ningún reintento; ese fichero se quedaba fuera de la carpeta
+        # para siempre. Reenviar la lista entera en cada cambio es seguro
+        # y barato porque el propio componente se salta ahora los .xml que
+        # ya tiene (mismo nombre = mismo contenido, llevan un digest del
+        # contenido en el nombre — ver writeFiles() en index.html): lo
+        # único que de verdad viaja es lo que de verdad falte allí.
+        if qid:
+            state_path = os.path.join(RAW_DIR, f"state_{qid}.json")
+            current = tuple(sorted(glob.glob(os.path.join(RAW_DIR, "*.xml"))))
+            if current and current != st.session_state.get("_folder_sync_snapshot"):
+                st.session_state["_folder_sync_snapshot"] = current
+                _queue_folder_write(list(current), state_path)
                 st.rerun()
     if picker and picker.get("wrote") is not None:
-        if picker["wrote"] > 0:
-            st.caption(f"✓ Copia guardada en tu carpeta: "
-                      f"{picker['wrote']}/{picker.get('total', picker['wrote'])} fichero(s).")
+        wrote, skipped = picker["wrote"], picker.get("skipped", 0)
+        if wrote > 0 or skipped > 0:
+            bits = []
+            if wrote:
+                bits.append(f"{wrote} nuevo(s)")
+            if skipped:
+                bits.append(f"{skipped} ya estaba(n)")
+            st.caption(f"✓ Carpeta al día: " + ", ".join(bits) + ".")
         if picker.get("errors"):
             st.caption("⚠ Algunos no se pudieron guardar: " +
                       "; ".join(picker["errors"][:3]))
@@ -1066,9 +1093,26 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
             # aunque el parseo de XML grandes tarde minutos.
             with st.status("Conectando con IBKR…", expanded=True) as status:
                 bar = st.progress(0.0)
+                # Línea que se ACTUALIZA en su sitio (st.empty), no una más
+                # por intento — con un bloque grande, get_statement() puede
+                # sondear a IBKR 12 veces antes de rendirse (hasta ~8 min) y,
+                # hasta ahora, no mandaba NADA mientras tanto. Ese silencio
+                # es tiempo de sobra para que un proxy intermedio (Streamlit
+                # Cloud está detrás de uno) dé la conexión del navegador por
+                # muerta aunque el proceso siga vivo en el servidor y acabe
+                # guardando bien — exactamente el síntoma que reportó Juan:
+                # "recargué la página y los datos ya estaban". Cada intento
+                # manda ahora tráfico al websocket, evitando ese corte.
+                poll_line = st.empty()
+
+                def _poll_tick(i, n, fase):
+                    verbo = "Pidiendo la referencia" if fase == "send" else "Esperando a IBKR"
+                    poll_line.markdown(f"↻ {verbo} (intento {i}/{n})…")
+
                 try:
                     status.write("Validando la query…")
-                    probe = client.fetch()
+                    probe = client.fetch(on_progress=_poll_tick)
+                    poll_line.empty()
                     v = validate_query(open(probe).read())
                     if not v["ok"]:
                         status.update(label="Query inválida", state="error")
@@ -1083,8 +1127,9 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
                         bar.progress(i / n)
                         status.write(f"Descargando bloque {i}/{n}: {fd} → {td}")
 
-                    backfill(client, state, state_path,
-                             start.strftime("%Y%m%d"), on_progress=_prog)
+                    backfill(client, state, state_path, start.strftime("%Y%m%d"),
+                             on_progress=_prog, on_poll_progress=_poll_tick)
+                    poll_line.empty()
                     bar.progress(1.0)
                     # Si no había ventanas pendientes (todo ya descargado de una
                     # sincronización anterior), on_progress no se llama nunca y el

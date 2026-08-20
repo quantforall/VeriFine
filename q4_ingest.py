@@ -208,7 +208,8 @@ class FlexClient:
         if code == "1025":
             raise RateLimitBlocked(code, msg)
 
-    def request_statement(self, fd: str | None = None, td: str | None = None) -> tuple[str, str]:
+    def request_statement(self, fd: str | None = None, td: str | None = None,
+                          on_progress=None) -> tuple[str, str]:
         params = {"t": self.token, "q": self.query_id, "v": "3"}
         if fd or td:
             if not (fd and td):
@@ -219,6 +220,8 @@ class FlexClient:
             params.update(fd=fd, td=td)
 
         for attempt in range(self.max_send_retries):
+            if on_progress:
+                on_progress(attempt + 1, self.max_send_retries, "send")
             self._pacer.wait()
             r = self._get(SEND, params, timeout=60)
             log.debug("SendRequest %s", _redact(r.url))
@@ -240,8 +243,10 @@ class FlexClient:
             raise FlexError(code, msg)
         raise FlexError("TIMEOUT", f"SendRequest no tuvo éxito tras {self.max_send_retries} intentos")
 
-    def get_statement(self, url: str, ref: str) -> str:
+    def get_statement(self, url: str, ref: str, on_progress=None) -> str:
         for attempt in range(self.max_poll):
+            if on_progress:
+                on_progress(attempt + 1, self.max_poll, "poll")
             self._pacer.wait()
             r = self._get(url, {"t": self.token, "q": ref, "v": "3"}, timeout=180)
             root = self._parse_envelope(r.text)
@@ -260,7 +265,7 @@ class FlexClient:
 
     # -- descubrimiento del último cierre disponible ----------------------
 
-    def latest_available_date(self) -> str | None:
+    def latest_available_date(self, on_progress=None) -> str | None:
         """max(reportDate) que IBKR tiene ya generado, vía la query sin fd/td.
 
         Necesario porque IBKR devuelve 1003 para TODO el bloque si `td` supera
@@ -272,8 +277,8 @@ class FlexClient:
         que su fecha máxima es el último cierre disponible sea cual sea su
         configuración. Devuelve None si el statement no trae ninguna fecha.
         """
-        ref, url = self.request_statement()
-        xml = self.get_statement(url, ref)
+        ref, url = self.request_statement(on_progress=on_progress)
+        xml = self.get_statement(url, ref, on_progress=on_progress)
         root = ET.fromstring(xml)
         dates = sorted(
             e.get("reportDate")
@@ -284,16 +289,29 @@ class FlexClient:
 
     # -- almacenamiento inmutable -----------------------------------------
 
-    def fetch(self, fd: str | None = None, td: str | None = None) -> str:
+    def fetch(self, fd: str | None = None, td: str | None = None,
+              on_progress=None) -> str:
         """Descarga un bloque y lo guarda tal cual. Devuelve la ruta del fichero.
 
         El XML crudo se guarda SIEMPRE y nunca se modifica. Cualquier bug de
         parseo se corrige reprocesando el crudo, jamás volviendo a descargar:
         IBKR puede haber cambiado datos históricos entre descargas y eso
         rompería la reproducibilidad de los golden values.
-        """
-        ref, url = self.request_statement(fd, td)
-        xml = self.get_statement(url, ref)
+
+        on_progress(intento, total, fase) — "send" (pidiendo la referencia,
+        normalmente rápido) o "poll" (esperando a que IBKR termine de
+        generar el informe, la parte que puede llevar varios minutos en
+        bloques grandes). Puramente informativo — no cambia reintentos ni
+        temporizaciones, sólo da a quien llama la ocasión de decir algo
+        mientras tanto. Sin esto, get_statement() puede estar varios
+        MINUTOS sin mandar nada — visto en la práctica: eso puede bastar
+        para que un proxy intermedio (Streamlit Cloud está detrás de uno)
+        dé por muerta la conexión del navegador por inactividad aunque el
+        proceso en el servidor siga vivo y termine bien — el usuario ve la
+        pantalla congelada y solo al recargar aparecen los datos, que en
+        realidad ya se habían guardado a tiempo."""
+        ref, url = self.request_statement(fd, td, on_progress=on_progress)
+        xml = self.get_statement(url, ref, on_progress=on_progress)
 
         os.makedirs(self.raw_dir, exist_ok=True)
         stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")

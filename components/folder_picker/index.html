@@ -125,11 +125,37 @@ ahí.
     return btoa(binary);
   }
 
+  // Los .xml llevan un digest del contenido en el propio nombre
+  // (`{query_id}_{tag}_{stamp}_{digest}.xml`, ver FlexClient.fetch() en
+  // q4_ingest.py) — si ya existe un fichero con ese nombre exacto, su
+  // contenido es SIEMPRE el mismo, así que saltarlo sin reescribir es
+  // seguro. El fichero de estado (state_<qid>.json) es la excepción: su
+  // nombre no cambia pero su contenido sí (windows_done crece), así que
+  // ESE se sobrescribe siempre. Esto es lo que hace seguro y barato
+  // volver a mandar la lista ENTERA de RAW_DIR en cada confirmación de
+  // carpeta (ver el "espejo" en app.py) en vez de sólo lo nuevo — de ahí
+  // que ya no dependamos de un único aviso puntual que se pueda perder si
+  // la conexión se cae a mitad de una sincronización larga.
+  async function alreadyHasFile(name) {
+    try {
+      await folderHandle.getFileHandle(name, {create: false});
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
   async function writeFiles(files) {
     let wrote = 0;
+    let skipped = 0;
     const errors = [];
     for (const f of files) {
       try {
+        const isState = f.name.startsWith("state_") && f.name.endsWith(".json");
+        if (!isState && await alreadyHasFile(f.name)) {
+          skipped++;
+          continue;
+        }
         const fh = await folderHandle.getFileHandle(f.name, {create: true});
         const w = await fh.createWritable();
         await w.write(b64ToBytes(f.content_b64));
@@ -140,7 +166,7 @@ ahí.
       }
     }
     setValue({supported: true, picked: true, name: folderHandle.name,
-             wrote, total: files.length, errors});
+             wrote, skipped, total: files.length, errors});
   }
 
   // "Borrar todo y empezar de nuevo" (§_danger_zone en app.py) también

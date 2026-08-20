@@ -65,7 +65,7 @@ MAX_TD_RETREAT = 4       # días hábiles que se retrocede el `td` ante un 1003 
 
 
 def _fetch_retreating(client: FlexClient, fd: str, td: str,
-                      max_retreat: int = MAX_TD_RETREAT) -> tuple[str, str]:
+                      max_retreat: int = MAX_TD_RETREAT, on_poll_progress=None) -> tuple[str, str]:
     """Descarga un bloque retrocediendo el `td` si IBKR responde 1003.
 
     plan_windows ya evita los fines de semana; esto cubre el caso residual de
@@ -73,12 +73,14 @@ def _fetch_retreating(client: FlexClient, fd: str, td: str,
     directamente al día hábil anterior para no gastar intentos en sábados y
     domingos, y está acotado para no disparar el 1025 ("demasiados intentos
     fallidos") de IBKR. Devuelve (td_real, path).
-    """
+
+    on_poll_progress: ver FlexClient.fetch() — solo pasa a través, nada
+    propio de aquí."""
     d = dt.datetime.strptime(td, "%Y%m%d")
     for _ in range(max_retreat + 1):
         cur_td = d.strftime("%Y%m%d")
         try:
-            return cur_td, client.fetch(fd, cur_td)
+            return cur_td, client.fetch(fd, cur_td, on_progress=on_poll_progress)
         except StatementNotAvailable:
             d = _prev_weekday(d - dt.timedelta(days=1))
             log.info("1003 en el corte del bloque; retrocedo td a %s", d.strftime("%Y%m%d"))
@@ -86,7 +88,8 @@ def _fetch_retreating(client: FlexClient, fd: str, td: str,
 
 
 def backfill(client: FlexClient, state: SyncState, state_path: str,
-             start: str, end: str | None = None, on_progress=None) -> SyncState:
+             start: str, end: str | None = None, on_progress=None,
+             on_poll_progress=None) -> SyncState:
     """Descarga el histórico completo. Reanudable: salta ventanas ya hechas.
 
     Un backfill de 6 años son 6 peticiones; si la cuarta falla, las tres
@@ -96,12 +99,26 @@ def backfill(client: FlexClient, state: SyncState, state_path: str,
     La reanudación se indexa por `fd` (inicio del bloque), no por (fd, td),
     porque el `td` puede haberse retrocedido por un festivo y no coincidiría
     con el planificado.
+
+    on_progress(i, n, fd, td)     -> qué bloque de la rejilla va (como antes).
+    on_poll_progress(i, n, fase)  -> ver FlexClient.fetch(): dentro de CADA
+                                     bloque, en qué intento de sondeo a IBKR
+                                     va. Sin esto, un bloque grande puede
+                                     estar varios MINUTOS sin mandar nada —
+                                     visto en la práctica, tiempo de sobra
+                                     para que Streamlit Cloud (detrás de un
+                                     proxy) dé la conexión del navegador por
+                                     muerta aunque el proceso siga vivo aquí
+                                     y termine guardando bien (pedido por
+                                     Juan: "recargué la página y los datos
+                                     estaban", justo ese síntoma).
     """
     # El corte final es el ÚLTIMO CIERRE DISPONIBLE, no hoy: pedir hasta hoy
     # cuando IBKR aún no ha generado el cierre da 1003 (o un 1001 transitorio en
     # bloques grandes). Se descubre igual que en el incremental.
     if end is None:
-        end = client.latest_available_date() or dt.datetime.now().strftime("%Y%m%d")
+        end = (client.latest_available_date(on_progress=on_poll_progress)
+               or dt.datetime.now().strftime("%Y%m%d"))
     state.history_start = state.history_start or start
 
     # La rejilla de ventanas se planifica SIEMPRE desde `state.history_start`
@@ -121,7 +138,7 @@ def backfill(client: FlexClient, state: SyncState, state_path: str,
         if on_progress:
             on_progress(i, len(pending), fd, td)
         try:
-            td_real, path = _fetch_retreating(client, fd, td)
+            td_real, path = _fetch_retreating(client, fd, td, on_poll_progress=on_poll_progress)
         except TokenExpired as e:
             state.paused_reason = str(e)
             state.save(state_path)
