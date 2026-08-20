@@ -288,6 +288,24 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
    necesita reiniciar el proceso, como cualquier cambio de config.toml). */
 [data-testid="stMainMenu"], #MainMenu {{ visibility:hidden; }}
 
+/* La barra de arriba del todo: es la cabecera PROPIA de la app
+   ([data-testid="stHeader"], 52px, position:absolute sobre el contenido),
+   y en Streamlit Cloud es donde se inyectan los iconos de gestión del
+   dueño (estrella, editar, GitHub, "Deploy"). En local sale transparente
+   y se ve el fondo oscuro de la app por debajo, así que nunca dio la
+   cara; en Cloud sale BLANCA — mismo patrón que el resto de contenedores
+   nativos que ya hubo que forzar aquí. Sí forma parte del DOM de la app,
+   de modo que este CSS la alcanza (los iconos de Cloud van dentro de
+   stToolbarActions, también aquí dentro). */
+[data-testid="stHeader"] {{ background-color: var(--bg) !important; }}
+[data-testid="stToolbar"], [data-testid="stToolbarActions"],
+[data-testid="stAppDeployButton"], [data-testid="stStatusWidget"] {{
+  background-color: transparent !important;
+}}
+[data-testid="stHeader"] *, [data-testid="stToolbar"] * {{
+  color: var(--fg) !important;
+}}
+
 /* Streamlit Cloud (comprobado en vivo en verifine.streamlit.app, distinto
    de lo que se ve en local) NO pinta el fondo oscuro en el CONTENEDOR de
    varios widgets pese a base="dark" en config.toml — probable diferencia
@@ -356,8 +374,39 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
   background-color: transparent !important;
   color: var(--fg) !important;
 }}
+/* El selector universal de arriba NO alcanza pseudo-elementos, y BaseWeb
+   pinta con ellos justo lo que seguía saliendo mal: las celdas VACÍAS del
+   mes (los huecos antes del día 1 y después del último) llevan un ::after
+   con content:"" y el color de fondo del tema — comprobado en local:
+   rgb(2,6,23), que aquí es nuestro --bg y pasa desapercibido, pero en
+   Cloud se resuelve en BLANCO. Esos eran los rectángulos blancos sueltos
+   dentro del calendario. Se anulan todos y se vuelve a afirmar debajo
+   solo el del día elegido, que sí queremos ver. */
+[data-baseweb="calendar"] *::before,
+[data-baseweb="calendar"] *::after {{
+  background-color: transparent !important;
+}}
 [data-baseweb="calendar"] [role="gridcell"][aria-label^="Selected"]::after {{
   background-color: var(--color-positive) !important;
+}}
+/* Texto oscuro encima del círculo verde: el blanco de --fg sobre #22C55E
+   se queda en ~2:1 de contraste (el número del día elegido casi no se
+   leía). Mismo tono que ya se usa en los chips del multiselect. */
+[data-baseweb="calendar"] [role="gridcell"][aria-label^="Selected"],
+[data-baseweb="calendar"] [role="gridcell"][aria-label^="Selected"] * {{
+  color: #04140A !important;
+}}
+/* Los días fuera de rango (en modo prueba el campo lleva min_value, así
+   que TODO lo anterior al límite de 6 meses sale deshabilitado) los
+   atenúa BaseWeb bajándoles el color: comprobado en una app de prueba con
+   min_value, gris rgb(163,168,184) frente al blanco de los elegibles, y
+   aria-label que empieza por "Not available" en vez de "Choose". El
+   selector universal de color de arriba se llevaba por delante ese
+   atenuado y los dejaba idénticos a los elegibles — parecían pulsables sin
+   serlo. Se restaura aquí. */
+[data-baseweb="calendar"] [role="gridcell"][aria-label^="Not available"],
+[data-baseweb="calendar"] [role="gridcell"][aria-label^="Not available"] * {{
+  color: var(--muted) !important;
 }}
 
 /* primaryColor (#22C55E) tampoco se aplica en Streamlit Cloud en varios
