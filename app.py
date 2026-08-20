@@ -344,7 +344,16 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
   color: var(--fg) !important;
   border-color: var(--border) !important;
 }}
-[data-baseweb="calendar"] button {{
+/* La regla de arriba solo pinta el CONTENEDOR exterior — background-color
+   no se hereda en CSS, así que la cabecera (mes/año y "Mo Tu We...") se
+   quedaba en su fondo blanco propio (reportado por Juan: cuerpo del
+   calendario ya oscuro, cabecera seguía en blanco). Sin data-testid ni
+   data-baseweb propios en esa cabecera — se fuerza transparente en TODOS
+   los descendientes, dejando que se vea el fondo oscuro del contenedor
+   por debajo; el círculo verde del día elegido es un ::after (regla de
+   abajo), no un background-color normal, así que esto no lo toca. */
+[data-baseweb="calendar"] * {{
+  background-color: transparent !important;
   color: var(--fg) !important;
 }}
 [data-baseweb="calendar"] [role="gridcell"][aria-label^="Selected"]::after {{
