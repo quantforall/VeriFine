@@ -1129,6 +1129,20 @@ def _release_sync_lock(state_path: str) -> None:
         os.remove(lock_path)
 
 
+def _resolve_raw_path(window: list) -> str:
+    """La ruta absoluta que trae guardada `windows_done` (`window[2]`) es la
+    que tenía cuando se descargó — con Drive de por medio, RAW_DIR es un
+    directorio temporal DISTINTO en cada sesión (ver q4_storage.
+    init_session_storage: tempfile.mkdtemp() nuevo cada vez), así que esa
+    ruta de una sesión anterior ya no existe en esta ("[Errno 2] No such
+    file or directory", visto en producción con Juan). El fichero SÍ está
+    — con el mismo nombre — porque init_session_storage() ya lo bajó de
+    Drive al RAW_DIR de ahora; solo hace falta recomponer la ruta con el
+    nombre de fichero (estable) sobre el RAW_DIR actual, nunca fiarse del
+    directorio que traiga guardado."""
+    return os.path.join(RAW_DIR, os.path.basename(window[2]))
+
+
 def _run_incremental_sync(token: str, qid: str, state_path: str):
     """Sincronización incremental manual: el mismo q4_sync.daily_job() que
     usa el cron (q4_daily.py), disparado a mano — para quien no tiene el
@@ -1250,7 +1264,7 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
         # si no, esta sección nunca llegaría a aparecer.
         try:
             state_now.watermark = load_paths(
-                tuple(w[2] for w in state_now.windows_done)).dates[-1]
+                tuple(_resolve_raw_path(w) for w in state_now.windows_done)).dates[-1]
             state_now.save(state_path)
         except Exception:
             pass
@@ -1397,7 +1411,8 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
                     # debe respetar lo pedido en "Histórico desde": sólo los
                     # bloques cuyo cierre (td) cae en o después de esa fecha.
                     cutoff = start.strftime("%Y%m%d")
-                    paths = tuple(w[2] for w in state.windows_done if w[1] >= cutoff)
+                    paths = tuple(_resolve_raw_path(w) for w in state.windows_done
+                                 if w[1] >= cutoff)
                     status.write(f"Parseando {len(paths)} extractos…")
                     st.session_state["paths"] = paths
                     load_paths(paths)          # parsea aquí, con feedback visible
@@ -2119,9 +2134,9 @@ def portfolio_view(ds: P.Dataset, accounts: list[str] | None):
     else:
         st.caption(
             "**Modo Patrimonio** (pastel y tabla de abajo): solo acciones y efectivo. Futuros "
-            "y opciones no entran aquí (no son capital inmovilizado) pero siguen apareciendo "
-            "en la tabla de Posiciones con su plusvalía — cambia a «Exposición» arriba para "
-            "incluirlos en el pastel y el % Peso.")
+            "y opciones no entran aquí (no son capital inmovilizado) — ni en el pastel, ni en "
+            "el % Peso, ni en la tabla de Posiciones — cambia a «Exposición» arriba para "
+            "verlos.")
 
     # Posiciones y efectivo van en DOS tablas, no en una (§21.4). No es sólo
     # estético: el efectivo no tiene precio de entrada ni plusvalía, y esas
@@ -2132,13 +2147,13 @@ def portfolio_view(ds: P.Dataset, accounts: list[str] | None):
     # 13 columnas no cabía, que es por lo que "Plusvalía" y "%" no se veían.
     if snap.positions:
         section_header("layers", "Posiciones")
-        _positions_table(snap)
+        _positions_table(snap, weight_basis)
     if snap.cash:
         section_header("activity", "Efectivo")
         _cash_table(snap)
 
 
-def _positions_table(snap):
+def _positions_table(snap, weight_basis):
     # Precio de entrada y Plusvalía llevaban semanas calculándose bien (ver
     # PositionRow) pero desaparecían de la tabla: comprobado en vivo que
     # st.dataframe, con width='stretch' y column_config parcial, DESCARTA
@@ -2156,6 +2171,19 @@ def _positions_table(snap):
     # se puede recuperar. "Entrada" (fecha) se quita también, a propósito,
     # para hacer sitio a Total/% Peso (a petición expresa) sin volver a
     # chocar con el límite de columnas de más abajo.
+    positions = snap.positions
+    if weight_basis == "patrimonio":
+        # En modo Patrimonio, futuros/opciones no cuentan ni para el
+        # patrimonio ni para su % (mismo criterio que el pastel —
+        # in_equity_weight, ver q4_trades.PIE_EXCLUDED_KINDS) — que
+        # tampoco aparezcan aquí, para no sugerir un peso sobre un total
+        # del que en realidad están excluidos. En Exposición sí entran.
+        positions = [p for p in positions if p.in_equity_weight]
+    if not positions:
+        st.caption("Sin acciones ni efectivo en las cuentas seleccionadas — cambia a "
+                  "«Exposición» arriba para ver futuros/opciones.")
+        return
+
     total_col = f"Total ({snap.currency})"
     pos_df = pd.DataFrame([dict(
         Cuenta=p.account, Ticker=p.symbol, Tipo=p.kind.capitalize(),
@@ -2165,7 +2193,7 @@ def _positions_table(snap):
         **{"%": p.pct_return * 100 if p.pct_return is not None else None},
         **{total_col: p.value_analysis_ccy},
         **{"% Peso": p.pct_weight},
-    ) for p in snap.positions]).sort_values("% Peso", ascending=False)
+    ) for p in positions]).sort_values("% Peso", ascending=False)
     # "Cantidad" y "Total"/"% Peso" NO van en signed: un corto es negativo
     # por convención (o representa un pasivo en Total), no una pérdida —
     # colorearlos en rojo confundiría dirección/magnitud con resultado.
