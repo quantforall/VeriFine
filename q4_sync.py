@@ -89,7 +89,7 @@ def _fetch_retreating(client: FlexClient, fd: str, td: str,
 
 def backfill(client: FlexClient, state: SyncState, state_path: str,
              start: str, end: str | None = None, on_progress=None,
-             on_poll_progress=None) -> SyncState:
+             on_poll_progress=None, on_saved=None) -> SyncState:
     """Descarga el histórico completo. Reanudable: salta ventanas ya hechas.
 
     Un backfill de 6 años son 6 peticiones; si la cuarta falla, las tres
@@ -112,6 +112,18 @@ def backfill(client: FlexClient, state: SyncState, state_path: str,
                                      y termine guardando bien (pedido por
                                      Juan: "recargué la página y los datos
                                      estaban", justo ese síntoma).
+    on_saved(state)                -> se llama justo después de CADA
+                                     `state.save(state_path)` del bucle
+                                     (~6-12 veces incluso en un histórico de
+                                     años, nunca miles). Gancho para que
+                                     quien llame replique ese guardado a
+                                     donde de verdad quiere que sobreviva
+                                     (p. ej. subir state.json + el XML de la
+                                     ventana a Drive, ver q4_storage.py) sin
+                                     que este módulo sepa nada de eso.
+                                     Ninguna llamada existente lo pasa, así
+                                     que el comportamiento por defecto no
+                                     cambia.
     """
     # El corte final es el ÚLTIMO CIERRE DISPONIBLE, no hoy: pedir hasta hoy
     # cuando IBKR aún no ha generado el cierre da 1003 (o un 1001 transitorio en
@@ -150,6 +162,8 @@ def backfill(client: FlexClient, state: SyncState, state_path: str,
         state.windows_done.append([fd, td_real, path])
         state.last_error = ""
         state.save(state_path)          # guardar tras CADA ventana
+        if on_saved:
+            on_saved(state)
 
     state.last_run = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     state.save(state_path)

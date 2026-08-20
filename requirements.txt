@@ -11,5 +11,10 @@ plotly>=5.20
 requests>=2.31
 yfinance>=0.2.40
 
+# Almacenamiento en Google Drive del usuario (sustituye a Camino A): guarda
+# el refresh_token de Google y el código de licencia en localStorage del
+# navegador — q4_drive.py habla con la API de Drive por su cuenta, sin SDK.
+streamlit-local-storage>=0.0.25
+
 # tests
 pytest>=8.0

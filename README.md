@@ -23,17 +23,51 @@ Toda decisión de cálculo vive ahí; este README sólo orienta.
 | `q4_selfcheck.py` | Auto-chequeo de integridad al cargar datos (T4/T5/T6b/§9). | §10 |
 | `q4_daily.py` | Entrypoint del job diario (launchd/cron); ver `deploy/`. | §19 |
 | `q4_license.py` | Control de acceso por suscripción (Substack), sin servidor propio. | — |
+| `q4_drive.py` | Cliente REST de Google Drive (OAuth + API v3), sin SDKs. | — |
+| `q4_storage.py` | Espejo entre el scratch dir de la sesión y la carpeta "VeriFine" en Drive. | — |
 | `app.py` | Panel VeriFine en Streamlit (sólo presentación). | §17 |
 
 ## Ejecutar el panel
 
+En producción (y por defecto en local) el panel exige conectar Google
+Drive: todo lo persistente — extractos, estado de sincronización, licencia
+y token de IBKR — vive en una carpeta "VeriFine" dentro del Drive del
+propio usuario, nunca en el disco del servidor (que en Streamlit Community
+Cloud es efímero). Ver "Conexión con Google Drive" más abajo para
+configurarlo.
+
 ```bash
 pip install -r requirements.txt
-Q4_RAW_DIR=./raw streamlit run app.py
+streamlit run app.py
 ```
 
-Carga los extractos de `Q4_RAW_DIR` (por defecto `./raw`) y recalcula todo desde
-ahí. Tema oscuro en `.streamlit/config.toml`.
+Para desarrollar en local SIN credenciales de Google (no persiste nada
+entre ejecuciones, solo para iterar rápido en la interfaz):
+
+```bash
+Q4_STORAGE_BACKEND=local Q4_RAW_DIR=./raw streamlit run app.py
+```
+
+Tema oscuro en `.streamlit/config.toml`.
+
+## Conexión con Google Drive
+
+1. En [Google Cloud Console](https://console.cloud.google.com/), crea un
+   OAuth Client ID de tipo "Web application".
+2. Configura la pantalla de consentimiento con los scopes
+   `drive.file` y `drive.appdata` (acotados a propósito — ver la cabecera
+   de `q4_drive.py`: evitan el proceso pesado de verificación de Google
+   para scopes "sensibles"; confirma la clasificación vigente en la
+   documentación de Google al desplegar, puede cambiar).
+3. Registra el/los redirect URI exactos: la URL de la app en Streamlit
+   Community Cloud, y `http://localhost:8503` si vas a probar en local.
+4. Copia `.streamlit/secrets.toml.example` a `.streamlit/secrets.toml`
+   (gitignoreado) y rellena `client_id`/`client_secret`/`redirect_uri`. En
+   Streamlit Community Cloud, esos mismos valores van en el panel de
+   "Secrets" de la app, no en un fichero.
+
+Sin esto configurado, el panel se detiene con un aviso claro en vez de
+fallar — no bloquea el resto del desarrollo (tests, `q4_daily.py`, etc.).
 
 ## Job diario
 
@@ -48,19 +82,23 @@ pip install -r requirements.txt
 Q4_GOLDEN_DIR=/ruta/a/tus/xml pytest -q
 ```
 
-61 tests. `test_golden.py` / `test_metrics.py` reproducen §13 desde los XML
+86 tests. `test_golden.py` / `test_metrics.py` reproducen §13 desde los XML
 crudos reales (no versionados, dato sensible; se leen de `Q4_GOLDEN_DIR`, por
 defecto `~/Downloads`, y se **saltan** si no están). El resto
-(`test_parser`, `test_ingest`, `test_benchmark`, `test_selfcheck`) corre offline.
+(`test_parser`, `test_ingest`, `test_sync`, `test_drive`, `test_storage`,
+`test_benchmark`, `test_selfcheck`, `test_license`) corre offline, sin red
+ni credenciales reales de IBKR o Google.
 
 ## Datos y credenciales
 
 - El **XML crudo es inmutable** (§18.7): un bug de parseo se corrige
   reprocesando, nunca volviendo a descargar. Todo `raw*/`, `data/`, cachés,
   estado y credenciales están gitignorados.
-- El **token de IBKR es una credencial**: vive en `.ibkr_credentials`
-  (gitignoreado) o en `IBKR_FLEX_TOKEN`/`IBKR_QUERY_ID`, nunca en logs ni en el
-  repo.
+- El **token de IBKR es una credencial**: nunca en logs ni en el repo. En el
+  job diario (`q4_daily.py`, cron/launchd local — ver `deploy/`) vive en
+  `.ibkr_credentials` o en `IBKR_FLEX_TOKEN`/`IBKR_QUERY_ID`. En el panel
+  interactivo (`app.py`) vive en la carpeta "VeriFine" del Drive del propio
+  usuario — ver "Conexión con Google Drive" más arriba —, no en este disco.
 
 ## Estado
 

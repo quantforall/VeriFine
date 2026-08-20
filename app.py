@@ -18,7 +18,7 @@ import json
 import time
 import glob
 import shutil
-import base64
+import uuid
 import datetime as dt
 
 import pandas as pd
@@ -33,6 +33,8 @@ import q4_benchmark as B
 import q4_license as L
 import q4_selfcheck as SC
 import q4_trades as T
+import q4_drive as D
+import q4_storage as ST
 
 st.set_page_config(page_title="VeriFine", page_icon=":bar_chart:", layout="wide")
 
@@ -105,20 +107,21 @@ def _apply_theme_palette(theme: str) -> None:
 
 PIE_COLORS = [SERIES, BENCH, POS, "#A78BFA", "#F472B6", "#2DD4BF", "#FB923C", "#818CF8", MUTED]
 
-# Por defecto, una ruta estable en el home del usuario — no relativa al
-# directorio de la app: si se reemplaza/actualiza la carpeta del código
-# (nueva versión entregada a un cliente), los datos ya sincronizados no se
-# quedan huérfanos ni se pisan con los de otra copia del programa.
+# Ruta LOCAL de trabajo de ESTA sesión — un directorio temporal, ver
+# _drive_gate()/q4_storage.init_session_storage(). El valor de aquí es solo
+# el que rige antes de que _drive_gate() la resuelva (arranque en frío de
+# main()) o en el escape de desarrollo Q4_STORAGE_BACKEND=local (ver más
+# abajo) — en producción, la copia persistente de verdad es la carpeta
+# "VeriFine" en el Drive del usuario, nunca este directorio.
 RAW_DIR = os.environ.get("Q4_RAW_DIR",
                           os.path.join(os.path.expanduser("~"), "VeriFine", "raw"))
-LICENSE_PATH = os.path.join(RAW_DIR, ".license.json")
+LICENSE_PATH = os.path.join(RAW_DIR, "license.json")
 
-# Mismo fichero/formato que ya usa q4_daily.py ({"token":..,"query_id":..}),
-# pero en RAW_DIR en vez de la raíz del proyecto — para que sobreviva a una
-# actualización del código igual que el resto de datos del usuario (§RAW_DIR
-# más arriba). Local, en el disco del propio usuario: no pasa por ningún
-# servidor. Opt-in vía el checkbox "Recordar en este equipo" de más abajo.
-IBKR_CREDS_PATH = os.path.join(RAW_DIR, ".ibkr_credentials")
+# Mismo formato que ya usa q4_daily.py ({"token":..,"query_id":..}). Vive en
+# RAW_DIR (el scratch dir de la sesión, espejado a Drive por
+# _save_ibkr_creds/_clear_ibkr_creds más abajo) — nunca en el navegador ni
+# en ningún disco que no sea el Drive del propio usuario.
+IBKR_CREDS_PATH = os.path.join(RAW_DIR, "ibkr_credentials.json")
 
 
 def _load_ibkr_creds() -> tuple[str, str]:
@@ -134,20 +137,15 @@ def _load_ibkr_creds() -> tuple[str, str]:
 def _save_ibkr_creds(token: str, qid: str) -> None:
     os.makedirs(RAW_DIR, exist_ok=True)
     json.dump({"token": token, "query_id": qid}, open(IBKR_CREDS_PATH, "w"))
+    ST.sync_up(st.session_state.get("_drive_folder"), RAW_DIR, "ibkr_credentials.json")
 
 
 def _clear_ibkr_creds() -> None:
     if os.path.exists(IBKR_CREDS_PATH):
         os.remove(IBKR_CREDS_PATH)
+    ST.sync_delete(st.session_state.get("_drive_folder"), "ibkr_credentials.json")
 
-# Componente a medida (protocolo crudo de Streamlit, sin build): detecta si
-# el navegador soporta elegir una carpeta real (File System Access API —
-# solo Chrome/Edge/Opera) y, si la elige, devuelve su nombre a Python. Fase
-# local (Camino A, paso 1 de 2): confirma la elección; todavía no escribe
-# los extractos ahí — ver components/folder_picker/index.html.
-_folder_picker = components.declare_component(
-    "folder_picker",
-    path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "components", "folder_picker"))
+
 # Invisible (0px): detecta si el navegador tiene Streamlit en claro u
 # oscuro (Settings -> "Choose app theme") y lo cuenta a los dos lados que
 # lo necesitan — ver su docstring en index.html y _apply_theme_palette()
@@ -709,6 +707,7 @@ def license_gate() -> str:
         # Validado de verdad contra el manifiesto (o licencia desactivada,
         # §evaluate): éste pasa a ser el último código válido guardado.
         attempt.save(LICENSE_PATH)
+        ST.sync_up(st.session_state.get("_drive_folder"), RAW_DIR, "license.json")
         st.caption("Licencia activa ✓")
         return "full"
 
@@ -801,179 +800,190 @@ def _cached_portfolio(paths: tuple[str, ...], accounts: tuple[str, ...] | None,
                        analysis_currency=currency)
 
 
-def _queue_folder_write(paths: list[str], state_path: str) -> None:
-    """Encola ficheros para que _connection_fields() se los pase al
-    componente de carpeta en el PRÓXIMO rerun (Camino A, fase "guardar al
-    salir", 1 de 3 — ver components/folder_picker/index.html). Incluye
-    siempre el estado de sincronización además de los XML, para que una
-    futura restauración (fase 3) tenga también windows_done/watermark, no
-    solo los extractos.
+# --------------------------------------------------------------------------
+# Google Drive — conexión y resolución de la carpeta "VeriFine" (sustituye
+# a "Camino A", el selector de carpeta local vía File System Access API,
+# que solo funcionaba en Chrome/Edge/Opera). Con Drive: cualquier
+# navegador, nada que instalar, y los datos viven en el Drive del propio
+# usuario — nunca en este servidor, que puede dormir/reiniciarse en
+# cualquier momento (Streamlit Community Cloud) sin perder nada. Ver
+# q4_drive.py (transporte OAuth + API REST) y q4_storage.py (el espejo
+# entre RAW_DIR de esta sesión y la carpeta Drive).
+# --------------------------------------------------------------------------
 
-    Si el usuario no ha elegido carpeta (o su navegador no la soporta,
-    Safari/Firefox), el componente ignora esto sin más — RAW_DIR en el
-    servidor sigue siendo la copia real, esto es solo una copia de más."""
-    files = []
-    for p in paths + ([state_path] if os.path.exists(state_path) else []):
-        try:
-            with open(p, "rb") as f:
-                files.append({"name": os.path.basename(p),
-                             "content_b64": base64.b64encode(f.read()).decode("ascii")})
-        except OSError:
-            continue
-    if files:
-        existing = st.session_state.get("_pending_folder_writes", [])
-        st.session_state["_pending_folder_writes"] = existing + files
+def _oauth_secrets() -> dict:
+    try:
+        return dict(st.secrets.get("google_oauth", {}))
+    except Exception:
+        return {}
+
+
+def _render_connect_landing(ls, client_id: str, redirect_uri: str) -> None:
+    """Pantalla de "Conectar con Google Drive" — primera visita, o tras
+    revocar el acceso. El nonce de CSRF se guarda en localStorage, no en
+    session_state: la ida y vuelta a accounts.google.com es una navegación
+    de página completa (no un rerun de Streamlit), así que session_state no
+    sobrevive el viaje pero localStorage sí."""
+    state = uuid.uuid4().hex
+    ls.setItem(itemKey="vf_oauth_state", itemValue=state)
+    auth_url = D.build_auth_url(client_id, redirect_uri, state)
+    st.markdown("### Conecta tu Google Drive")
+    st.caption("VeriFine guarda tus extractos de IBKR, tu histórico de "
+              "sincronización, tu licencia y tu token de IBKR en una "
+              "carpeta «VeriFine» dentro de TU Google Drive — nunca en "
+              "este servidor, que puede reiniciarse en cualquier momento. "
+              "Solo hace falta una vez; las próximas visitas no lo vuelven "
+              "a pedir.")
+    st.link_button("Conectar con Google Drive", auth_url)
+
+
+def _drive_gate() -> D.DriveFolder | None:
+    """Punto de entrada obligatorio al principio de main(): sin conexión a
+    Drive, nada más se ejecuta (st.stop()). Devuelve el DriveFolder ya
+    resuelto, y reasigna RAW_DIR/LICENSE_PATH/IBKR_CREDS_PATH (globales del
+    módulo) al directorio local de ESTA sesión, ya hidratado desde Drive.
+
+    Escape de desarrollo: Q4_STORAGE_BACKEND=local salta todo esto y deja
+    RAW_DIR en su valor por defecto (~/VeriFine/raw) — solo para
+    `streamlit run app.py` en local sin credenciales de Google. Nunca debe
+    ser el comportamiento en producción."""
+    global RAW_DIR, LICENSE_PATH, IBKR_CREDS_PATH
+
+    if os.environ.get("Q4_STORAGE_BACKEND") == "local":
+        return None
+
+    # Ya resuelto en un rerun anterior de esta sesión: Streamlit re-ejecuta
+    # el fichero entero en cada rerun, así que RAW_DIR ya ha vuelto a su
+    # valor por defecto más arriba en ESTE mismo rerun — hay que
+    # reasignarlo desde lo que se guardó la primera vez, sin volver a
+    # tocar Drive (list/download en cada clic sería lentísimo y
+    # machacaría la cuota de la API para nada).
+    if "_drive_folder" in st.session_state:
+        RAW_DIR = st.session_state["_raw_dir"]
+        LICENSE_PATH = os.path.join(RAW_DIR, "license.json")
+        IBKR_CREDS_PATH = os.path.join(RAW_DIR, "ibkr_credentials.json")
+        return st.session_state["_drive_folder"]
+
+    from streamlit_local_storage import LocalStorage
+    ls = LocalStorage()
+
+    secrets = _oauth_secrets()
+    client_id, client_secret = secrets.get("client_id", ""), secrets.get("client_secret", "")
+    redirect_uri = secrets.get("redirect_uri", "")
+    if not (client_id and client_secret and redirect_uri):
+        st.error("Falta configurar la conexión con Google Drive (secretos "
+                 "`google_oauth.client_id` / `client_secret` / `redirect_uri`).")
+        st.stop()
+
+    tokens = st.session_state.get("_drive_tokens")
+    if tokens is None:
+        stored_refresh = ls.getItem("vf_google_refresh_token")
+        params = st.query_params
+        if "code" in params:
+            expected_state = ls.getItem("vf_oauth_state")
+            if expected_state is not None:
+                ls.deleteItem("vf_oauth_state")
+            if params.get("state") != expected_state:
+                st.query_params.clear()
+                st.error("El intento de conexión con Google no es válido "
+                         "(el estado no coincide). Vuelve a intentarlo.")
+                st.stop()
+            try:
+                tokens = D.exchange_code(client_id, client_secret, redirect_uri, params["code"])
+            except D.DriveError as e:
+                st.query_params.clear()
+                st.error(f"No se pudo conectar con Google Drive: {e}")
+                st.stop()
+            if not tokens.refresh_token and stored_refresh:
+                tokens.refresh_token = stored_refresh
+            if tokens.refresh_token:
+                ls.setItem(itemKey="vf_google_refresh_token", itemValue=tokens.refresh_token)
+            st.session_state["_drive_tokens"] = tokens
+            st.query_params.clear()
+            st.rerun()
+        elif stored_refresh:
+            # Visita de vuelta: solo hay refresh_token en el navegador, sin
+            # access_token vivo — el ensure_fresh() de abajo lo renueva
+            # (expiry ya en el pasado a propósito para forzarlo).
+            tokens = D.DriveTokens(access_token="", refresh_token=stored_refresh,
+                                   expiry="2000-01-01T00:00:00+00:00")
+        else:
+            _render_connect_landing(ls, client_id, redirect_uri)
+            st.stop()
+
+    try:
+        tokens = D.ensure_fresh(client_id, client_secret, tokens)
+    except D.AuthError:
+        if ls.getItem("vf_google_refresh_token") is not None:
+            ls.deleteItem("vf_google_refresh_token")
+        st.session_state.pop("_drive_tokens", None)
+        st.warning("Tu conexión con Google Drive ha caducado o fue revocada.")
+        _render_connect_landing(ls, client_id, redirect_uri)
+        st.stop()
+    st.session_state["_drive_tokens"] = tokens
+
+    try:
+        drive = D.DriveFolder.resolve_or_create(tokens)
+    except D.DriveError as e:
+        st.error(f"No se pudo acceder a tu carpeta de Drive: {e}")
+        st.stop()
+
+    RAW_DIR = ST.init_session_storage(drive)
+    LICENSE_PATH = os.path.join(RAW_DIR, "license.json")
+    IBKR_CREDS_PATH = os.path.join(RAW_DIR, "ibkr_credentials.json")
+    st.session_state["_raw_dir"] = RAW_DIR
+    st.session_state["_drive_folder"] = drive
+    return drive
 
 
 def _connection_fields() -> tuple[str, str]:
-    """Token, Query ID, "Recordar" y el selector de carpeta. Se llama DENTRO
-    del expander colapsable de main() (igual que license_gate(), ver su
-    docstring) — de ahí st.X en vez de st.sidebar.X."""
-    # Un único camino: conectar con IBKR. Sin opción de subir XML a mano —
-    # lo ya descargado en sesiones anteriores se sigue leyendo solo, más
-    # abajo, sin que haga falta tocar el token para volver a verlo.
-    st.caption("El token da acceso de lectura a tus extractos.")
+    """Token, Query ID. Se llama DENTRO del expander colapsable de main()
+    (igual que license_gate(), ver su docstring) — de ahí st.X en vez de
+    st.sidebar.X.
+
+    Antes había una casilla "Recordar en este equipo" (opt-in) para guardar
+    el token/Query ID en disco local. Con Google Drive conectado
+    (obligatorio para llegar aquí, ver _drive_gate()) ya no hace falta un
+    opt-in aparte: haber conectado Drive ES el consentimiento para guardar
+    datos del usuario en SU carpeta, así que se guarda solo, sin casilla."""
+    st.caption("El token da acceso de lectura a tus extractos. Se guarda en "
+              "tu carpeta «VeriFine» de Google Drive — no hace falta "
+              "repetirlo en tu próxima visita.")
     saved_token, saved_qid = _load_ibkr_creds()
     token = st.text_input("Token", type="password", value=saved_token)
     qid = st.text_input("Query ID", value=saved_qid)
-    remember = st.checkbox(
-        "Recordar en este equipo", value=bool(saved_token or saved_qid),
-        help="Guarda el token y el Query ID en tu propio disco "
-             f"({IBKR_CREDS_PATH}) para no tener que repetirlos cada vez. "
-             "Nunca sale de tu ordenador.")
-    if remember:
-        if token and qid and (token, qid) != (saved_token, saved_qid):
-            _save_ibkr_creds(token, qid)
-    elif saved_token or saved_qid:
+    if token and qid and (token, qid) != (saved_token, saved_qid):
+        _save_ibkr_creds(token, qid)
+    elif not (token or qid) and (saved_token or saved_qid):
         _clear_ibkr_creds()
-
-    # "files_to_write" solo va en la llamada si hay algo pendiente (§
-    # _queue_folder_write, encolado tras la última sincronización) — sin
-    # esto, el componente reenviaría los mismos ficheros en cada rerun.
-    picker_kwargs = {"key": "folder_picker"}
-    pending = st.session_state.pop("_pending_folder_writes", None)
-    if pending:
-        picker_kwargs["files_to_write"] = pending
-
-    # Fase 3 (restaurar al entrar): mientras el servidor no tenga extractos
-    # — contenedor efímero de Streamlit Cloud recién reiniciado, o primera
-    # carga de esta sesión — le pedimos al navegador lo que tenga guardado
-    # en la carpeta recordada. Ver want_restore en components/folder_picker/
-    # index.html.
-    picker_kwargs["want_restore"] = not bool(glob.glob(os.path.join(RAW_DIR, "*.xml")))
-
-    # "Borrar todo" (§_danger_zone) deja esto pendiente para el rerun
-    # siguiente al suyo propio — session_state.clear() no lo borra porque
-    # se pone DESPUÉS de esa llamada.
-    if st.session_state.pop("_wipe_folder_pending", False):
-        picker_kwargs["wipe_folder"] = True
-
-    picker = _folder_picker(**picker_kwargs)
-    if picker and picker.get("picked"):
-        st.session_state["chosen_folder_name"] = picker["name"]
-        # La carpeta confirmada es un ESPEJO de RAW_DIR, no solo de lo
-        # nuevo: en cada rerun (cualquier clic en cualquier sitio de la
-        # app, no hace falta que sea aquí) se compara la lista actual de
-        # RAW_DIR contra la última que se mandó a la carpeta EN ESTA
-        # SESIÓN, y si ha cambiado se reenvía TODA la lista otra vez.
-        #
-        # Antes esto era un envío de una sola vez (una bandera de sesión):
-        # si esa única entrega se perdía — la sincronización termina bien
-        # en el servidor pero el st.rerun() que la lleva al componente cae
-        # sobre una conexión ya muerta por una espera larga a IBKR (visto
-        # en la práctica: Juan recargó la página y los extractos SÍ
-        # estaban en RAW_DIR, pero nunca llegaron a la carpeta) — no había
-        # ningún reintento; ese fichero se quedaba fuera de la carpeta
-        # para siempre. Reenviar la lista entera en cada cambio es seguro
-        # y barato porque el propio componente se salta ahora los .xml que
-        # ya tiene (mismo nombre = mismo contenido, llevan un digest del
-        # contenido en el nombre — ver writeFiles() en index.html): lo
-        # único que de verdad viaja es lo que de verdad falte allí.
-        if qid:
-            state_path = os.path.join(RAW_DIR, f"state_{qid}.json")
-            current = tuple(sorted(glob.glob(os.path.join(RAW_DIR, "*.xml"))))
-            if current and current != st.session_state.get("_folder_sync_snapshot"):
-                st.session_state["_folder_sync_snapshot"] = current
-                _queue_folder_write(list(current), state_path)
-                st.rerun()
-    if picker and picker.get("wrote") is not None:
-        wrote, skipped = picker["wrote"], picker.get("skipped", 0)
-        if wrote > 0 or skipped > 0:
-            bits = []
-            if wrote:
-                bits.append(f"{wrote} nuevo(s)")
-            if skipped:
-                bits.append(f"{skipped} ya estaba(n)")
-            st.caption(f"✓ Carpeta al día: " + ", ".join(bits) + ".")
-        if picker.get("errors"):
-            st.caption("⚠ Algunos no se pudieron guardar: " +
-                      "; ".join(picker["errors"][:3]))
-    if picker and picker.get("wiped") is not None:
-        st.caption(f"🗑 Carpeta vaciada: {picker['wiped']} fichero(s) borrados.")
-        if picker.get("wipe_errors"):
-            st.caption("⚠ Algunos no se pudieron borrar: " +
-                      "; ".join(picker["wipe_errors"][:3]))
-    if picker and picker.get("restored_files"):
-        _restore_from_folder(picker["restored_files"])
-
     return token, qid
 
 
-def _restore_from_folder(files: list[dict]) -> None:
-    """Fase 3/3 de Camino A: escribe en RAW_DIR lo que el navegador acaba de
-    leer de la carpeta recordada (ver readAllForRestore() en
-    components/folder_picker/index.html) — solo llega cuando el servidor
-    empezó sin datos Y el navegador ya tenía carpeta con permiso confirmado.
-
-    Guarda de sesión obligatoria: Streamlit NO limpia el valor devuelto por
-    un componente entre reruns — sin `_restore_done`, el siguiente rerun
-    (el que provoca el propio st.rerun() de aquí abajo) volvería a ver el
-    mismo `restored_files` y reintentaría para siempre."""
-    if st.session_state.get("_restore_done"):
-        return
-    st.session_state["_restore_done"] = True
-    os.makedirs(RAW_DIR, exist_ok=True)
-    written = 0
-    for f in files:
-        name = f.get("name", "")
-        # Nombres inesperados (rutas, ocultos) nunca deberían llegar —
-        # readAllForRestore() ya filtra por patrón, esto es cinturón y
-        # tirantes contra escribir fuera de RAW_DIR.
-        if not name or "/" in name or "\\" in name or name.startswith("."):
-            continue
-        dest = os.path.join(RAW_DIR, name)
-        if os.path.exists(dest):
-            continue  # no pisar nada que el servidor ya tenga
-        try:
-            with open(dest, "wb") as fh:
-                fh.write(base64.b64decode(f["content_b64"]))
-            written += 1
-        except (OSError, KeyError, ValueError, TypeError):
-            continue
-    if written:
-        st.toast(f"↺ Restaurados {written} fichero(s) desde tu carpeta.", icon="✅")
-        st.rerun()
-
-
 def _danger_zone():
-    """Borra TODO (extractos, estado de sincronización, credenciales
-    recordadas, licencia, y — si hay carpeta elegida — su contenido
-    también) — para empezar de cero. Mismo sitio que _connection_fields():
-    dentro del expander colapsable de main()."""
+    """Borra TODO (extractos, estado de sincronización, token/Query ID de
+    IBKR, licencia) — tanto el espejo local de esta sesión como la carpeta
+    "VeriFine" en Drive. Para empezar de cero. Mismo sitio que
+    _connection_fields(): dentro del expander colapsable de main()."""
     st.divider()
     st.caption("Borra todos los extractos descargados, el estado de "
-              "sincronización, el token/Query ID recordados en este equipo, "
-              "el código de licencia y — si has elegido carpeta — los "
-              "extractos que tengas guardados ahí. No se puede deshacer — "
-              "la próxima vez hay que sincronizar desde cero.")
+              "sincronización, el token/Query ID de IBKR y el código de "
+              "licencia — tanto de esta sesión como de tu carpeta "
+              "«VeriFine» en Google Drive. No se puede deshacer — la "
+              "próxima vez hay que sincronizar desde cero.")
     confirm_wipe = st.checkbox("Confirmo que quiero borrarlo todo", key="confirm_wipe_all")
     if st.button("Borrar todo y empezar de nuevo", disabled=not confirm_wipe):
+        drive = st.session_state.get("_drive_folder")
+        tokens = st.session_state.get("_drive_tokens")
+        raw_dir = st.session_state.get("_raw_dir")
+        ST.wipe_drive_folder(drive)
         shutil.rmtree(RAW_DIR, ignore_errors=True)
         st.session_state.clear()
-        # DESPUÉS de clear() a propósito — si no, se borraría a sí mismo
-        # antes de que _connection_fields() llegue a leerlo en el próximo
-        # rerun (ver picker_kwargs["wipe_folder"] ahí).
-        st.session_state["_wipe_folder_pending"] = True
+        # La conexión con Google sobrevive al borrado a propósito: "Borrar
+        # todo" vacía los DATOS, no debe forzar además una reconexión.
+        if drive is not None:
+            st.session_state["_drive_folder"] = drive
+            st.session_state["_drive_tokens"] = tokens
+            st.session_state["_raw_dir"] = raw_dir
         st.rerun()
 
 
@@ -1008,6 +1018,45 @@ def _incremental_recompute_fn() -> dict[str, float]:
     return out
 
 
+def _acquire_sync_lock(state_path: str) -> bool:
+    """Cerrojo de sincronización — evita que dos ejecuciones pidan a la vez
+    contra la misma query (el limitador de ritmo de FlexClient vive EN
+    MEMORIA, por instancia; dos sesiones a la vez suman su ritmo sin que
+    ninguna lo sepa, y eso basta para un 1025 sin que nadie haya
+    reintentado a mano — ver el comentario largo en sidebar_source()).
+
+    Con Drive conectado el cerrojo vive EN Drive (un fichero visible para
+    TODAS las sesiones de esa carpeta) — el .lock local que había antes
+    solo protegía sesiones que compartieran el mismo RAW_DIR, y desde que
+    cada sesión tiene su propio scratch dir aislado (ver _drive_gate) ya
+    nunca coinciden, así que habría dejado de proteger nada. Sin Drive
+    (Q4_STORAGE_BACKEND=local, desarrollo), se mantiene el cerrojo de
+    fichero de siempre — ahí sí hay un único RAW_DIR compartido."""
+    drive = st.session_state.get("_drive_folder")
+    if drive is not None:
+        return drive.acquire_lock(os.path.basename(state_path) + ".lock",
+                                  stale_seconds=LOCK_STALE_S)
+    lock_path = f"{state_path}.lock"
+    if os.path.exists(lock_path):
+        age = time.time() - os.path.getmtime(lock_path)
+        if age < LOCK_STALE_S:
+            return False
+    os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+    with open(lock_path, "w") as f:
+        f.write(str(time.time()))
+    return True
+
+
+def _release_sync_lock(state_path: str) -> None:
+    drive = st.session_state.get("_drive_folder")
+    if drive is not None:
+        drive.release_lock(os.path.basename(state_path) + ".lock")
+        return
+    lock_path = f"{state_path}.lock"
+    if os.path.exists(lock_path):
+        os.remove(lock_path)
+
+
 def _run_incremental_sync(token: str, qid: str, state_path: str):
     """Sincronización incremental manual: el mismo q4_sync.daily_job() que
     usa el cron (q4_daily.py), disparado a mano — para quien no tiene el
@@ -1016,17 +1065,10 @@ def _run_incremental_sync(token: str, qid: str, state_path: str):
     from q4_ingest import FlexClient
     from q4_sync import daily_job
 
-    lock_path = f"{state_path}.lock"
-    if os.path.exists(lock_path):
-        age = time.time() - os.path.getmtime(lock_path)
-        if age < LOCK_STALE_S:
-            st.error(f"Ya hay una sincronización en marcha para esta query "
-                     f"(empezó hace {int(age)}s). Espera a que termine.")
-            return
-
-    os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
-    with open(lock_path, "w") as f:
-        f.write(str(time.time()))
+    if not _acquire_sync_lock(state_path):
+        st.error("Ya hay una sincronización en marcha para esta query "
+                 "(en esta u otra sesión/pestaña). Espera a que termine.")
+        return
     try:
         client = FlexClient(token=token, query_id=qid, raw_dir=RAW_DIR)
         with st.status("Sincronizando desde el último día…", expanded=True) as status:
@@ -1057,8 +1099,9 @@ def _run_incremental_sync(token: str, qid: str, state_path: str):
                         st.warning("Los años cerrados han cambiado: " +
                                   " · ".join(res["golden_drift"]))
                     if res.get("raw_path"):
-                        _queue_folder_write([res["raw_path"]], state_path)
-                        st.rerun()  # sin esto, el fichero no llega al componente hasta el próximo clic
+                        ST.sync_up(st.session_state.get("_drive_folder"), RAW_DIR,
+                                  os.path.basename(res["raw_path"]),
+                                  os.path.basename(state_path))
                 elif res["status"] == "no_new_data":
                     status.update(label="Ya estabas al día", state="complete")
                     st.info("Sin sesiones nuevas — nada que traer.")
@@ -1069,8 +1112,7 @@ def _run_incremental_sync(token: str, qid: str, state_path: str):
                 status.update(label="Error en la sincronización", state="error")
                 st.error(str(e))
     finally:
-        if os.path.exists(lock_path):
-            os.remove(lock_path)
+        _release_sync_lock(state_path)
 
 
 def _history_start_field(qid: str, license_mode: str) -> pd.Timestamp:
@@ -1191,24 +1233,16 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
         # corriendo en el servidor, un script suelto tipo probe_ibkr.py a la
         # vez que la app), cada una respeta su propio ritmo pero IBKR ve la
         # suma — eso basta para un 1025 sin que nadie haya reintentado a
-        # mano. El candado es un fichero con marca de tiempo: si ya hay uno
-        # reciente, se rechaza el clic en vez de sumar otra ejecución.
-        lock_path = f"{state_path}.lock"
-        if os.path.exists(lock_path):
-            age = time.time() - os.path.getmtime(lock_path)
-            if age < LOCK_STALE_S:
-                st.error(
-                    f"Ya hay una sincronización en marcha para esta query "
-                    f"(empezó hace {int(age)}s, en esta u otra pestaña/sesión). "
-                    "Pedir a la vez desde dos sitios es lo que suele acabar en "
-                    "un 1025. Espera a que termine; si sabes que en realidad "
-                    f"no hay ninguna corriendo (se quedó colgada), borra "
-                    f"{lock_path} y reintenta.")
-                return None
+        # mano. Ver _acquire_sync_lock(): con Drive conectado el candado
+        # vive en la carpeta compartida, no en un fichero local por sesión.
+        if not _acquire_sync_lock(state_path):
+            st.error(
+                "Ya hay una sincronización en marcha para esta query (en "
+                "esta u otra pestaña/sesión). Pedir a la vez desde dos "
+                "sitios es lo que suele acabar en un 1025 de IBKR. Espera "
+                "a que termine.")
+            return None
 
-        os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
-        with open(lock_path, "w") as f:
-            f.write(str(time.time()))
         try:
             client = FlexClient(token=token, query_id=qid, raw_dir=RAW_DIR)
             # st.status en el CUERPO PRINCIPAL, no en la barra lateral: es el
@@ -1248,13 +1282,30 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
 
                     state = SyncState.load(state_path, qid)
                     before_n = len(state.windows_done)
+                    drive = st.session_state.get("_drive_folder")
 
                     def _prog(i, n, fd, td):
                         bar.progress(i / n)
                         status.write(f"Descargando bloque {i}/{n}: {fd} → {td}")
 
+                    def _on_saved(s):
+                        # Sube el estado + el XML de la ventana recién
+                        # completada a Drive, UNA POR UNA (ver docstring de
+                        # q4_sync.backfill, on_saved) — así una interrupción a
+                        # media descarga (contenedor dormido/reiniciado) no
+                        # pierde lo ya conseguido: queda en Drive, no solo en
+                        # el scratch dir efímero de esta sesión.
+                        last_path = s.windows_done[-1][2]
+                        ST.sync_up(drive, RAW_DIR, os.path.basename(last_path),
+                                  os.path.basename(state_path))
+
                     backfill(client, state, state_path, start.strftime("%Y%m%d"),
-                             on_progress=_prog, on_poll_progress=_poll_tick)
+                             on_progress=_prog, on_poll_progress=_poll_tick,
+                             on_saved=_on_saved)
+                    # El guardado FINAL de backfill() (state.last_run) queda
+                    # fuera del bucle, así que on_saved no lo cubre — un
+                    # último envío recoge ese último cambio.
+                    ST.sync_up(drive, RAW_DIR, os.path.basename(state_path))
                     poll_line.empty()
                     bar.progress(1.0)
                     # Si no había ventanas pendientes (todo ya descargado de una
@@ -1284,18 +1335,13 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
                                   expanded=True)
                     st.success(f"Listo: {fetched} bloque(s) nuevo(s) · "
                               f"{len(paths)} extractos cargados en el panel.")
-                    if fetched:
-                        new_paths = [w[2] for w in state.windows_done[before_n:]]
-                        _queue_folder_write(new_paths, state_path)
-                        st.rerun()  # sin esto, no llega al componente hasta el próximo clic
                 except Exception as e:
                     status.update(label="Error en la sincronización", state="error",
                                   expanded=True)
                     st.error(str(e))
                     return None
         finally:
-            if os.path.exists(lock_path):
-                os.remove(lock_path)
+            _release_sync_lock(state_path)
     if st.session_state.get("paths"):
         return load_paths(st.session_state["paths"])
 
@@ -2385,6 +2431,11 @@ def main():
         unsafe_allow_html=True)
     st.sidebar.markdown(f'<div class="vf-brand">{svg("target", 22)}VeriFine</div>',
                         unsafe_allow_html=True)
+
+    # Puerta de entrada obligatoria: sin conexión a Google Drive, nada más
+    # se pinta (st.stop() dentro). RAW_DIR ya queda apuntando al scratch dir
+    # de esta sesión, hidratado desde la carpeta "VeriFine" del usuario.
+    _drive_gate()
 
     # Licencia/Token/Query ID/carpeta van en un bloque plegable — a
     # petición expresa, para no ocupar sitio en el sidebar en cada visita
