@@ -645,6 +645,7 @@ ICONS = {
     "check": '<polyline points="20 6 9 17 4 12"/>',
     "alert-circle": '<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/>'
                     '<line x1="12" y1="16" x2="12.01" y2="16"/>',
+    "cloud": '<path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/>',
 }
 
 
@@ -827,13 +828,25 @@ def _render_connect_landing(ls, client_id: str, redirect_uri: str) -> None:
     state = uuid.uuid4().hex
     ls.setItem(itemKey="vf_oauth_state", itemValue=state)
     auth_url = D.build_auth_url(client_id, redirect_uri, state)
-    st.markdown("### Conecta tu Google Drive")
-    st.caption("VeriFine guarda tus extractos de IBKR, tu histórico de "
-              "sincronización, tu licencia y tu token de IBKR en una "
-              "carpeta «VeriFine» dentro de TU Google Drive — nunca en "
-              "este servidor, que puede reiniciarse en cualquier momento. "
-              "Solo hace falta una vez; las próximas visitas no lo vuelven "
-              "a pedir.")
+    st.markdown(f'<div class="vf-sec">{svg("cloud", 20)}<h3>Conecta tu Google Drive</h3></div>',
+               unsafe_allow_html=True)
+    st.markdown(
+        "VeriFine necesita un sitio donde guardar tus extractos de IBKR, el estado de "
+        "sincronización, tu licencia y el token de tu Flex Query, para que no tengas "
+        "que volver a introducirlos cada vez que entras. Te pedimos conectar tu cuenta "
+        "de Google para que ese sitio sea **tu propio Google Drive** — no un servidor "
+        "de VeriFine.")
+    _guide_callout("info", "check",
+                  "<strong>No se guarda nada en ningún servidor de VeriFine.</strong> Al "
+                  "conectar, la app crea (o reutiliza, si ya existe de una visita "
+                  "anterior) una carpeta llamada <strong>«VeriFine»</strong> dentro de tu "
+                  "Drive, y ahí — solo ahí — vive toda tu información. El servidor donde "
+                  "corre esta app puede reiniciarse o dormirse en cualquier momento sin "
+                  "que pierdas nada, precisamente porque nunca fue él quien la guardaba.")
+    st.caption("El acceso que pedimos está limitado a esa carpeta que la propia app "
+              "crea — no a tu Drive entero. Puedes desconectar cuando quieras desde "
+              "«Conexión y licencia» sin que se borre nada de lo ya guardado. Solo hace "
+              "falta conectar una vez; las próximas visitas no lo vuelven a pedir.")
     st.link_button("Conectar con Google Drive", auth_url)
 
 
@@ -957,6 +970,38 @@ def _connection_fields() -> tuple[str, str]:
     elif not (token or qid) and (saved_token or saved_qid):
         _clear_ibkr_creds()
     return token, qid
+
+
+def _disconnect_google():
+    """Desconecta la cuenta de Google de VeriFine — a diferencia de
+    _danger_zone(), NO toca nada de lo que haya en la carpeta "VeriFine"
+    del Drive del usuario (sigue siendo suyo, se queda tal cual). Revoca el
+    token de verdad en el lado de Google (ver q4_drive.revoke — no es solo
+    "olvidarlo" aquí) y lo borra de localStorage; la próxima visita vuelve
+    a pedir "Conectar con Google Drive". Mismo sitio que _connection_fields()
+    / _danger_zone(): dentro del expander colapsable de main()."""
+    st.caption("Desconecta tu cuenta de Google de VeriFine (revoca el acceso de verdad, "
+              "no solo lo olvida aquí). Lo que ya tengas guardado en tu carpeta "
+              "«VeriFine» de Drive NO se toca — sigue siendo tuyo. La próxima vez que "
+              "entres, tendrás que volver a conectar.")
+    if st.button("Desconectar de Google"):
+        tokens = st.session_state.get("_drive_tokens")
+        if tokens is not None:
+            try:
+                D.revoke(tokens.refresh_token or tokens.access_token)
+            except D.DriveError as e:
+                st.warning(f"No se pudo avisar a Google (puede que ya estuviera "
+                          f"desconectado igualmente): {e}")
+        try:
+            from streamlit_local_storage import LocalStorage
+            ls = LocalStorage()
+            if ls.getItem("vf_google_refresh_token") is not None:
+                ls.deleteItem("vf_google_refresh_token")
+        except Exception:
+            pass
+        for key in ("_drive_tokens", "_drive_folder", "_raw_dir"):
+            st.session_state.pop(key, None)
+        st.rerun()
 
 
 def _danger_zone():
@@ -2004,7 +2049,7 @@ def portfolio_view(ds: P.Dataset, accounts: list[str] | None):
         if snap.pie:
             # Etiquetas FUERA de cada porción con línea propia (textposition
             # "outside" de Plotly), no una leyenda lateral en caja — y máximo
-            # 6 porciones (top 5 + "Otros", ya recortado en q4_trades.portfolio).
+            # 9 porciones (top 8 + "Otros", ya recortado en q4_trades.portfolio).
             fig = go.Figure(go.Pie(
                 labels=[s.label for s in snap.pie], values=[s.value_analysis_ccy for s in snap.pie],
                 hole=0.55, sort=False, rotation=0,
@@ -2056,31 +2101,40 @@ def _positions_table(snap):
     # = corto), igual que en cualquier extracto de bróker — no hace falta
     # repetirlo. "Precio actual" se quita porque, de las cuatro, es la que
     # menos aporta ya con Plusvalía y % al lado; con más ancho disponible
-    # se puede recuperar.
+    # se puede recuperar. "Entrada" (fecha) se quita también, a propósito,
+    # para hacer sitio a Total/% Peso (a petición expresa) sin volver a
+    # chocar con el límite de columnas de más abajo.
+    total_col = f"Total ({snap.currency})"
     pos_df = pd.DataFrame([dict(
         Cuenta=p.account, Ticker=p.symbol, Tipo=p.kind.capitalize(),
         Divisa=p.currency, Cantidad=p.quantity,
-        Entrada=fmt_date(p.entry_date), **{"Precio entrada": p.entry_price},
+        **{"Precio entrada": p.entry_price},
         **{"Plusvalía": p.unrealized_gain_local},
         **{"%": p.pct_return * 100 if p.pct_return is not None else None},
-    ) for p in snap.positions]).sort_values(["Tipo", "Ticker"])
-    # "Cantidad" NO va en signed: un corto es negativo por convención, no una
-    # pérdida — colorearlo en rojo confundiría dirección con resultado.
+        **{total_col: p.value_analysis_ccy},
+        **{"% Peso": p.pct_weight},
+    ) for p in snap.positions]).sort_values("% Peso", ascending=False)
+    # "Cantidad" y "Total"/"% Peso" NO van en signed: un corto es negativo
+    # por convención (o representa un pasivo en Total), no una pérdida —
+    # colorearlos en rojo confundiría dirección/magnitud con resultado.
     st.dataframe(style(pos_df, ["Plusvalía", "%"]), width='stretch', hide_index=True,
                 column_config={
-                    "Cuenta": st.column_config.TextColumn(width=85),
+                    "Cuenta": st.column_config.TextColumn(width=80),
                     "Ticker": st.column_config.TextColumn(width=60),
-                    "Tipo": st.column_config.TextColumn(width=70),
-                    "Divisa": st.column_config.TextColumn(width=55),
-                    "Cantidad": st.column_config.NumberColumn(width=70),
-                    "Entrada": st.column_config.TextColumn(width=80),
-                    "Precio entrada": st.column_config.NumberColumn(width=90),
-                    "Plusvalía": st.column_config.NumberColumn(width=90),
-                    "%": st.column_config.NumberColumn(width=60),
+                    "Tipo": st.column_config.TextColumn(width=65),
+                    "Divisa": st.column_config.TextColumn(width=52),
+                    "Cantidad": st.column_config.NumberColumn(width=65),
+                    "Precio entrada": st.column_config.NumberColumn(width=85),
+                    "Plusvalía": st.column_config.NumberColumn(width=85),
+                    "%": st.column_config.NumberColumn(width=55),
+                    total_col: st.column_config.NumberColumn(width=95),
+                    "% Peso": st.column_config.NumberColumn(width=65),
                 })
-    st.caption("Cantidad negativa = posición corta. Precio actual y dirección explícita "
-              "se han quitado de esta tabla para que quepan sin recortarse Precio de "
-              "entrada y Plusvalía, que es lo que importa aquí.")
+    st.caption(f"Cantidad negativa = posición corta. **Total** y **% Peso** en la divisa "
+              f"base de análisis ({snap.currency}), sobre el mismo patrimonio total del "
+              "pastel de arriba — no en la divisa local de cada posición (columna Divisa). "
+              "Orden por defecto: de mayor a menor peso. Precio actual, dirección explícita "
+              "y fecha de entrada se han quitado de esta tabla para que quepa sin recortarse.")
 
 
 def _cash_table(snap):
@@ -2322,7 +2376,15 @@ def configuracion_view():
                    "La query se configura una vez por cuenta — la app la reutiliza tanto "
                    "para el histórico completo como para cada sincronización posterior.")
 
-    _guide_step("01", "target", "Introduce tu licencia",
+    _guide_step("01", "cloud", "Conecta tu Google Drive",
+                "Ya lo has hecho — es el paso obligatorio para entrar en VeriFine, por "
+                "eso puedes ver esta pantalla. Tus extractos, tu licencia y el token de "
+                "IBKR viven en la carpeta <strong>«VeriFine»</strong> que se creó en tu "
+                "Google Drive al conectar — nunca en un servidor de VeriFine. Puedes "
+                "desconectar la cuenta cuando quieras desde «Conexión y licencia», en "
+                "el lateral, sin que se borre nada de lo ya guardado.")
+
+    _guide_step("02", "target", "Introduce tu licencia",
                 "El código llega en el <strong>último correo de pago</strong> de tu "
                 "suscripción de Substack. Pégalo en el campo <strong>Licencia</strong>, "
                 "arriba del todo en el lateral, y pulsa «Verificar licencia». Sin él "
@@ -2330,7 +2392,7 @@ def configuracion_view():
                 "Métricas y Cartera, pero Efecto divisa, Operaciones e Informe quedan "
                 "bloqueadas hasta verificarlo.")
 
-    _guide_step("02", "layers", "Crea la Flex Query en el Client Portal",
+    _guide_step("03", "layers", "Crea la Flex Query en el Client Portal",
                 "Inicia sesión en el <strong>Client Portal</strong> de IBKR → engranaje de "
                 "Configuración → Configuración de informes → <strong>Consultas Flex "
                 "(Flex Queries)</strong> → crear una nueva <strong>Activity Flex Query</strong>. "
@@ -2362,7 +2424,7 @@ def configuracion_view():
                   "de confirmar su etiqueta XML exacta.")
     _onboarding_screenshot("Ver la pantalla de Secciones", "01-secciones.png")
 
-    _guide_step("03", "file-text", "Formato y configuración general",
+    _guide_step("04", "file-text", "Formato y configuración general",
                 "Todavía dentro de la misma query, en <strong>Formato</strong> y "
                 "<strong>Configuración general</strong>. Dos de estos valores no son "
                 "cosméticos: sin «Separar por día» en Sí la query devuelve un único "
@@ -2383,7 +2445,7 @@ def configuracion_view():
     _onboarding_screenshot("Ver la pantalla de Formato y configuración general",
                            "02-formato-general.png")
 
-    _guide_step("04", "arrows-exchange", "Genera el token del Flex Web Service",
+    _guide_step("05", "arrows-exchange", "Genera el token del Flex Web Service",
                 "En el mismo Client Portal: engranaje de Configuración → Configuración "
                 "de informes → <strong>Servicio Flex Web (Flex Web Service)</strong> → "
                 "Configurar → generar token. Da acceso de <strong>solo lectura</strong> "
@@ -2394,7 +2456,7 @@ def configuracion_view():
                   "— basta con generar uno nuevo aquí y pegarlo de nuevo abajo, sin "
                   "tocar la Flex Query.")
 
-    _guide_step("05", "target", "Pega el token y el Query ID aquí",
+    _guide_step("06", "target", "Pega el token y el Query ID aquí",
                 "Copia el token y el <strong>Query ID</strong> (aparece junto al nombre "
                 "de tu query en el listado de Consultas Flex) en los campos de la "
                 "izquierda y pulsa <strong>Sincronizar</strong>. VeriFine descarga el "
@@ -2448,6 +2510,8 @@ def main():
         license_mode = license_gate()
         token, qid = _connection_fields()
         start = _history_start_field(qid, license_mode)
+        st.divider()
+        _disconnect_google()
         _danger_zone()
 
     ds = sidebar_source(license_mode, token, qid, start)

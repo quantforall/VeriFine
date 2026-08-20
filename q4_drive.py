@@ -43,6 +43,7 @@ log = logging.getLogger("q4.drive")
 
 AUTH_BASE = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
+REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 DRIVE_API = "https://www.googleapis.com/drive/v3"
 UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
 
@@ -152,6 +153,26 @@ def refresh_access_token(client_id: str, client_secret: str, tokens: DriveTokens
     if r.status_code >= 400:
         raise DriveError(f"No se pudo refrescar el token de Google: {r.text[:200]}")
     return _tokens_from_response(r.json(), fallback_refresh=tokens.refresh_token)
+
+
+def revoke(token: str, session: requests.Session | None = None) -> None:
+    """Desconectar de verdad, no solo "olvidar" el token en el navegador:
+    esto lo invalida en el lado de Google, así que deja de servir aunque
+    alguien lo tuviera guardado en otro sitio. Pásale el refresh_token
+    cuando lo haya — revocar un refresh_token invalida también todo access
+    token emitido a partir de él; revocar solo el access_token no toca el
+    refresh_token, que seguiría siendo válido.
+
+    Tolerante a que Google ya no lo reconozca (400: el usuario ya lo había
+    revocado él mismo desde su cuenta, o ya estaba caducado) — el
+    resultado que importa, sin acceso, es el mismo; solo se considera
+    fallo un error de verdad (5xx, red)."""
+    if not token:
+        return
+    session = session or requests.Session()
+    r = session.request("POST", REVOKE_URL, data={"token": token}, timeout=REQUEST_TIMEOUT)
+    if 500 <= r.status_code < 600:
+        raise DriveError(f"No se pudo revocar el token en Google: {r.text[:200]}")
 
 
 def ensure_fresh(client_id: str, client_secret: str, tokens: DriveTokens,

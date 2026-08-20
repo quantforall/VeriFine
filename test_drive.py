@@ -224,6 +224,29 @@ def test_ensure_fresh_skips_refresh_when_still_valid():
     assert out is fresh
 
 
+def test_revoke_noop_without_token():
+    sess = ScriptedTokenSession([])  # no debería llamarse
+    D.revoke("", session=sess)
+    assert sess.calls == []
+
+
+def test_revoke_success():
+    sess = ScriptedTokenSession([(200, {})])
+    D.revoke("SOME-TOKEN", session=sess)
+    assert sess.calls[0][0] == "POST" and sess.calls[0][1] == D.REVOKE_URL
+
+
+def test_revoke_tolerates_already_invalid_token():
+    sess = ScriptedTokenSession([(400, {"error": "invalid_token"})])
+    D.revoke("STALE-TOKEN", session=sess)  # no debe lanzar
+
+
+def test_revoke_raises_on_server_error():
+    sess = ScriptedTokenSession([(503, {"error": "unavailable"})])
+    with pytest.raises(D.DriveError):
+        D.revoke("SOME-TOKEN", session=sess)
+
+
 def test_ensure_fresh_refreshes_when_expired():
     stale = D.DriveTokens(access_token="OLD", refresh_token="RT",
                           expiry="2000-01-01T00:00:00+00:00")

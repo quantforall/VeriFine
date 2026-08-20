@@ -458,6 +458,13 @@ class PositionRow:
     pct_return: float | None
     value_local: float               # positionValue (IBKR)
     in_equity_weight: bool           # False para futuros/opciones (ver arriba)
+    value_analysis_ccy: float = 0.0  # value_local convertido a la divisa de análisis
+    # % que esta posición representa sobre equity_total_analysis_ccy (mismo
+    # denominador que el pastel de más abajo) — None sólo si equity_total es
+    # 0 (cartera vacía). Se rellena en una segunda pasada, al final de
+    # portfolio(): equity_total no se conoce del todo hasta sumar también el
+    # efectivo, que se procesa DESPUÉS del bucle de posiciones.
+    pct_weight: float | None = None
 
 
 @dataclass
@@ -486,9 +493,12 @@ class PortfolioSnapshot:
 
 
 def portfolio(ds: P.Dataset, accounts: list[str] | None = None,
-             analysis_currency: str | None = None, pie_top_n: int = 5) -> PortfolioSnapshot:
-    # top 5 + "Otros" = máximo 6 porciones — umbral de legibilidad de un
-    # pie/donut (más categorías, cambiar a barra apilada).
+             analysis_currency: str | None = None, pie_top_n: int = 8) -> PortfolioSnapshot:
+    # top 8 + "Otros" = máximo 9 porciones (a petición expresa: con 5+Otros
+    # el bloque "Otros" se comía demasiado del pastel). 9 no es arbitrario:
+    # coincide con el número de colores de PIE_COLORS en app.py — subir esto
+    # más exige ampliar esa paleta antes, o dos porciones acabarían
+    # compartiendo color.
     m = analysis_currency or ds.base_currency
     fx = E.FX(P.fx_matrix(ds), ds.base_currency)
 
@@ -588,7 +598,8 @@ def portfolio(ds: P.Dataset, accounts: list[str] | None = None,
             quantity=r["quantity"], entry_price=cb_price,
             entry_date=earliest_entry.get(key),
             current_price=r["price"], unrealized_gain_local=unrl,
-            pct_return=pct, value_local=r["value_local"], in_equity_weight=in_weight))
+            pct_return=pct, value_local=r["value_local"], in_equity_weight=in_weight,
+            value_analysis_ccy=value_analysis))
 
         if in_weight:
             equity_total += value_analysis
@@ -615,6 +626,14 @@ def portfolio(ds: P.Dataset, accounts: list[str] | None = None,
             # al tipo de cambio vigente, sea la divisa que sea; en la tabla de
             # detalle (cash_rows, arriba) sigue apareciendo por cuenta/divisa.
             pie_pool["Efectivo"] = pie_pool.get("Efectivo", 0.0) + value_analysis
+
+    # Segunda pasada: equity_total ya está cerrado (incluye el efectivo,
+    # procesado arriba DESPUÉS del bucle de posiciones) — mismo denominador
+    # que usan las porciones del pastel, así que "% Peso" en la tabla y el
+    # "%" de cada porción del pastel significan lo mismo.
+    for row in rows:
+        row.pct_weight = (100 * row.value_analysis_ccy / equity_total
+                          if equity_total else None)
 
     ordered = sorted(pie_pool.items(), key=lambda kv: -kv[1])
     top, rest = ordered[:pie_top_n], ordered[pie_top_n:]
