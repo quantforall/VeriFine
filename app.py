@@ -251,7 +251,12 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
 .vf-step-head h3 {{ font-size:18px; font-weight:600; margin:0; display:flex;
   align-items:center; gap:9px; }}
 .vf-step-head .vf-ico {{ color:{POS}; }}
-.vf-step-note {{ color:var(--muted); font-size:14px; max-width:66ch; margin:8px 0 16px; }}
+.vf-step-note {{ color:var(--muted); font-size:14px; margin:8px 0 16px; text-align:justify; }}
+/* Párrafo de intro de la guía de alta ("Antes de sincronizar..."): mismo
+   pedido de alineación justificada que los .vf-step-note de abajo, para
+   que todo el bloque de texto de la guía se vea consistente en vez de
+   que el primer párrafo desentone (a petición de Juan, con captura). */
+.st-key-guide-intro p {{ text-align: justify; }}
 .vf-checklist {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr));
   gap:8px; margin:6px 0 4px; }}
 .vf-check-item {{ display:flex; align-items:flex-start; gap:8px; font-size:13px;
@@ -326,6 +331,50 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
 [data-baseweb="select"], [data-baseweb="textarea"] {{
   background-color: var(--card) !important;
   border-color: var(--border) !important;
+}}
+
+/* El bloque de arriba forzaba el FONDO y el borde de los campos, pero no
+   el color del TEXTO: ese se quedaba a merced del tema, y en Cloud eso
+   significa el gris oscuro del tema claro sobre el fondo oscuro que
+   nosotros sí forzamos — la fecha por defecto o lo que se escribe se
+   confundía con el fondo (reportado por Juan). Los <input> no heredan el
+   color del contenedor, así que hay que apuntarlos directamente.
+   -webkit-text-fill-color hace falta además para lo que rellena el
+   gestor de contraseñas (el campo Token), donde Chrome ignora `color`. */
+[data-testid="stTextInputRootElement"] input,
+[data-testid="stDateInputField"], [data-testid="stNumberInputField"],
+[data-baseweb="input"] input, [data-baseweb="base-input"] input,
+[data-baseweb="select"] input, [data-baseweb="textarea"] textarea {{
+  color: var(--fg) !important;
+  -webkit-text-fill-color: var(--fg) !important;
+}}
+[data-testid="stTextInputRootElement"] input::placeholder,
+[data-testid="stDateInputField"]::placeholder,
+[data-baseweb="input"] input::placeholder,
+[data-baseweb="select"] input::placeholder {{
+  color: var(--muted) !important;
+  -webkit-text-fill-color: var(--muted) !important;
+}}
+/* El valor que muestra un selectbox no es un <input>, es un div aparte.
+   El multiselect queda FUERA a propósito: sus chips ya llevan texto
+   oscuro sobre verde unas reglas más abajo, y un color general aquí se
+   los comería. */
+[data-testid="stSelectbox"] [data-baseweb="select"] {{
+  color: var(--fg) !important;
+}}
+/* Slider: el número que va encima del pomo y las etiquetas de los
+   extremos. En Cloud el pomo sale además en el rojo por defecto en vez de
+   nuestro verde, mismo caso que las pestañas o los chips.
+   La barra de relleno se deja como esté a propósito: BaseWeb la pinta con
+   un linear-gradient calculado al vuelo que codifica la POSICIÓN del
+   rango elegido — sobrescribirlo con un color fijo borraría esa
+   información y dejaría la barra plana. */
+[data-testid="stSliderThumbValue"] {{ color: var(--color-positive) !important; }}
+[data-testid="stSliderTickBar"], [data-testid="stSliderTickBar"] span {{
+  color: var(--muted) !important;
+}}
+[data-testid="stSlider"] [role="slider"] {{
+  background-color: var(--color-positive) !important;
 }}
 [data-testid="stBaseButton-secondary"] {{
   background-color: var(--card) !important;
@@ -2004,10 +2053,14 @@ def configuracion_view():
     para poder volver a consultarla más adelante."""
     st.markdown('<div class="vf-guide-eyebrow">Primera vez con VeriFine</div>',
                unsafe_allow_html=True)
-    st.markdown("Antes de sincronizar hacen falta dos cosas: tu **licencia** y una "
-               "**Flex Query** de Interactive Brokers con su **token** de solo lectura. "
-               "La query se configura una vez por cuenta — la app la reutiliza tanto "
-               "para el histórico completo como para cada sincronización posterior.")
+    # st.markdown() en esta versión de Streamlit (1.50.0, ver requirements.txt)
+    # no admite key= — el gancho para el CSS de justificado (§THEME_CSS,
+    # .st-key-guide-intro) va en el st.container que lo envuelve.
+    with st.container(key="guide-intro"):
+        st.markdown("Antes de sincronizar hacen falta dos cosas: tu **licencia** y una "
+                   "**Flex Query** de Interactive Brokers con su **token** de solo lectura. "
+                   "La query se configura una vez por cuenta — la app la reutiliza tanto "
+                   "para el histórico completo como para cada sincronización posterior.")
 
     _guide_step("01", "target", "Introduce tu licencia",
                 "El código llega en el <strong>último correo de pago</strong> de tu "
