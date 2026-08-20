@@ -474,19 +474,16 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
 [data-testid="stSelectbox"] [data-baseweb="select"] {{
   color: var(--fg) !important;
 }}
-/* Slider: el número que va encima del pomo y las etiquetas de los
-   extremos. En Cloud el pomo sale además en el rojo por defecto en vez de
-   nuestro verde, mismo caso que las pestañas o los chips.
-   La barra de relleno se deja como esté a propósito: BaseWeb la pinta con
-   un linear-gradient calculado al vuelo que codifica la POSICIÓN del
-   rango elegido — sobrescribirlo con un color fijo borraría esa
-   información y dejaría la barra plana. */
-[data-testid="stSliderThumbValue"] {{ color: var(--color-positive) !important; }}
+/* Slider: solo las etiquetas de los extremos (legibilidad, nada que ver
+   con el color de acento). El pomo, el número que lleva encima y la
+   barra de relleno se dejan TAL CUAL los pinta Streamlit — rojo nativo,
+   a petición expresa de Juan — así que aquí ya no se fuerza ni el pomo ni
+   stSliderThumbValue a nuestro verde como se hacía antes. La barra de
+   relleno en sí NUNCA se ha tocado: BaseWeb la pinta con un
+   linear-gradient calculado al vuelo que codifica la posición del rango
+   elegido — forzarle un color fijo la dejaría plana. */
 [data-testid="stSliderTickBar"], [data-testid="stSliderTickBar"] span {{
   color: var(--muted) !important;
-}}
-[data-testid="stSlider"] [role="slider"] {{
-  background-color: var(--color-positive) !important;
 }}
 [data-testid="stBaseButton-secondary"] {{
   background-color: var(--card) !important;
@@ -749,6 +746,59 @@ def _tab_gate(license_mode: str) -> bool:
 @st.cache_data(show_spinner="Parseando extractos…")
 def load_paths(paths: tuple[str, ...]) -> P.Dataset:
     return P.load(list(paths))
+
+
+@st.cache_data(show_spinner=False)
+def _cached_attribute(paths: tuple[str, ...], start: str, end: str,
+                      currency: str | None, accounts: tuple[str, ...] | None) -> E.Attribution:
+    """Envoltorio cacheado de E.attribute() — la llamada más repetida y más
+    cara del motor: aparece en las 5 pestañas de resultados (una vez suelta
+    en cada una, y encima una vez POR AÑO/POR VENTANA dentro de
+    years_table()/trailing_table()) y hasta ahora se recalculaba entera en
+    CUALQUIER interacción en CUALQUIER sitio de la app — st.tabs() no es
+    perezoso: aunque solo se vea una pestaña, las 5 ejecutan su cuerpo
+    entero en cada rerun (pedido por Juan: "va un poco lento").
+
+    Clave de caché en `paths` (tupla de ficheros, ya la usa load_paths())
+    en vez del propio Dataset — un objeto Python arbitrario grande sería
+    lento de hashear en cada llamada, aparte de frágil. `accounts` como
+    tupla por lo mismo: las listas ya casan con el hasher de Streamlit,
+    pero una tupla dijo siempre "igual que el resto del fichero"."""
+    ds = load_paths(paths)          # ya cacheado aparte — prácticamente gratis si no cambia
+    return E.attribute(ds, start, end, analysis_currency=currency,
+                       accounts=list(accounts) if accounts else None)
+
+
+def _attr(start: str, end: str, currency: str | None,
+         accounts: list[str] | None) -> E.Attribution:
+    """Atajo para las 6 llamadas a E.attribute() de las vistas — pasa por
+    _cached_attribute() en vez de llamar al motor directo. Toma
+    st.session_state["paths"] en vez de `ds` (que las vistas SÍ tienen a
+    mano) a propósito: es la clave de caché barata que ya usa load_paths(),
+    no hace falta arrastrar `ds` hasta aquí para no usarlo."""
+    return _cached_attribute(st.session_state["paths"], start, end, currency,
+                             tuple(accounts) if accounts else None)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_trades(paths: tuple[str, ...], start: str, end: str,
+                   accounts: tuple[str, ...] | None):
+    """Mismo motivo y mismo patrón que _cached_attribute(): T.build()
+    (pestaña Operaciones) también se recalculaba entero en cada rerun de
+    cualquier pestaña, aunque nadie estuviera mirando Operaciones."""
+    ds = load_paths(paths)
+    return T.build(ds, start, end, accounts=list(accounts) if accounts else None)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_portfolio(paths: tuple[str, ...], accounts: tuple[str, ...] | None,
+                      currency: str | None):
+    """Mismo motivo y mismo patrón que _cached_attribute(): T.portfolio()
+    (pestaña Cartera) también se recalculaba entero en cada rerun de
+    cualquier pestaña, aunque nadie estuviera mirando Cartera."""
+    ds = load_paths(paths)
+    return T.portfolio(ds, accounts=list(accounts) if accounts else None,
+                       analysis_currency=currency)
 
 
 def _queue_folder_write(paths: list[str], state_path: str) -> None:
@@ -1258,7 +1308,14 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
         sorted(glob.glob("./data/*.xml"))
     if local:
         st.sidebar.caption(f"Usando {len(local)} extractos del almacén ({RAW_DIR})")
-        return load_paths(tuple(local))
+        # Mismo session_state["paths"] que deja el camino de sincronización
+        # de arriba — las vistas lo usan como clave de caché para el motor
+        # (ver _cached_attribute más abajo); sin esto, recargar la página
+        # con datos ya existentes dejaba esa clave vacía y la caché nunca
+        # llegaba a activarse en ese caso.
+        paths = tuple(local)
+        st.session_state["paths"] = paths
+        return load_paths(paths)
     return None
 
 
@@ -1514,7 +1571,7 @@ def years_table(ds: P.Dataset, currency: str, rf: float, dates: list[str],
             continue
         b = year_dates[-1]
         try:
-            att = E.attribute(ds, a, b, analysis_currency=currency, accounts=accounts)
+            att = _attr(a, b, currency, accounts)
         except Exception:
             continue
         m = M.from_series(att.series_strategy, rf=rf)
@@ -1541,7 +1598,7 @@ def trailing_table(ds: P.Dataset, currency: str, rf: float, dates: list[str],
                          "Vol": None, "Máx. DD": None, bench_col: None,
                          "Nota": f"Sin datos · requiere histórico desde {w['needs']}"})
             continue
-        att = E.attribute(ds, w["start"], w["end"], analysis_currency=currency, accounts=accounts)
+        att = _attr(w["start"], w["end"], currency, accounts)
         m = M.from_series(att.series_strategy, rf=rf)
         rows.append({"Ventana": w["label"], "Acum. total": att.total * 100,
                      "Acum. estrategia": att.strategy * 100,
@@ -1594,7 +1651,7 @@ def efecto_divisa_view(ds: P.Dataset, accounts: list[str] | None, currency: str,
     Total real — nunca una aproximación lineal silenciosa (§20.2 aplica el
     mismo principio de cierre por construcción a otro cálculo)."""
     try:
-        att = E.attribute(ds, d0, d1, analysis_currency=currency, accounts=accounts)
+        att = _attr(d0, d1, currency, accounts)
     except E.UndefinedReturn as e:
         st.error(f"La serie tiene un tramo no calculable (§9): {e}")
         return
@@ -1745,7 +1802,8 @@ def style(df: pd.DataFrame, signed: list[str]):
 def operations_view(ds: P.Dataset, accounts: list[str] | None, d0: str, d1: str):
     """§20 — pestaña Operaciones. Divisa local del instrumento, no la divisa
     de análisis de Métricas: son dos preguntas distintas (§20.1)."""
-    detail, aggs = T.build(ds, d0, d1, accounts=accounts)
+    detail, aggs = _cached_trades(st.session_state["paths"], d0, d1,
+                                  tuple(accounts) if accounts else None)
     if not aggs:
         st.info("No hay operaciones en el periodo/cuentas seleccionadas. Esto requiere "
                 "haber ampliado el Flex Query con la sección Operaciones (§20.3).")
@@ -1869,7 +1927,8 @@ def portfolio_view(ds: P.Dataset, accounts: list[str] | None):
     Métricas — son preguntas distintas (§20.1 aplica el mismo criterio a
     Operaciones)."""
     currency = ds.base_currency
-    snap = T.portfolio(ds, accounts=accounts, analysis_currency=currency)
+    snap = _cached_portfolio(st.session_state["paths"],
+                             tuple(accounts) if accounts else None, currency)
     if not snap.positions and not snap.cash:
         st.info("No hay posiciones abiertas ni efectivo en las cuentas seleccionadas.")
         return
@@ -2006,7 +2065,7 @@ def informe_view(ds: P.Dataset, accounts: list[str] | None, currency: str, rf: f
     ya calculan Métricas/Operaciones/Cartera para el mismo periodo (§20/§21)."""
     try:
         with st.spinner("Calculando informe…"):
-            att = E.attribute(ds, d0, d1, analysis_currency=currency, accounts=accounts)
+            att = _attr(d0, d1, currency, accounts)
     except E.UndefinedReturn as e:
         st.error(f"La serie tiene un tramo no calculable (§9): {e}")
         return
@@ -2031,7 +2090,7 @@ def informe_view(ds: P.Dataset, accounts: list[str] | None, currency: str, rf: f
     vals = {}
     for ccy in ("EUR", "USD"):
         try:
-            a = E.attribute(ds, d0, d1, analysis_currency=ccy, accounts=accounts)
+            a = _attr(d0, d1, ccy, accounts)
             vals[ccy] = (a.strategy, a.fx, a.total)
         except E.UndefinedReturn:
             vals[ccy] = (None, None, None)
@@ -2471,7 +2530,7 @@ def main():
 def _metricas_tab(ds, currency, rf, accounts, dates, d0, d1, bench_primary, bench_tickers):
     try:
         with st.spinner("Calculando TWR y atribución…"):
-            att = E.attribute(ds, d0, d1, analysis_currency=currency, accounts=accounts or None)
+            att = _attr(d0, d1, currency, accounts)
     except E.UndefinedReturn as e:
         st.error(f"La serie tiene un tramo no calculable (§9): {e}")
         st.stop()
