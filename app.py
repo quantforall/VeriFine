@@ -664,11 +664,28 @@ def section_header(icon: str, title: str):
 # Licencia (suscripción de Substack) — ver q4_license.py
 # --------------------------------------------------------------------------
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_valid_codes_cached() -> list[str] | None:
-    # Cacheado una hora: evita pedir el manifiesto en cada rerun de
-    # Streamlit (un clic en cualquier widget vuelve a ejecutar main()).
-    return L.fetch_valid_codes()
+    """Una vez por SESIÓN, no en cada rerun de Streamlit (un clic en
+    cualquier widget vuelve a ejecutar main()) — pero sí una vez por
+    sesión/carga nueva de la app, a petición expresa (Juan cambió el
+    código en el Gist y la app lo seguía dando por válido): antes esto se
+    cacheaba con @st.cache_data(ttl=3600), que es un caché de TODO EL
+    PROCESO del servidor compartido entre TODAS las sesiones/usuarios —
+    cambiar el Gist podía tardar hasta una hora en notarse, y encima
+    afectaba a cualquiera que entrara mientras tanto, no solo a quien
+    tenía la pestaña abierta. session_state es por sesión: cada carga
+    nueva de la app (pestaña nueva, recarga) vuelve a comprobar de verdad.
+
+    Solo se recuerda un fetch que SÍ ha tenido éxito (lista real, no
+    None) — si falla (red, timeout), se reintenta en el siguiente rerun en
+    vez de quedarse atascado en modo de gracia el resto de la sesión."""
+    cached = st.session_state.get("_license_valid_codes")
+    if cached is not None:
+        return cached
+    codes = L.fetch_valid_codes()
+    if codes is not None:
+        st.session_state["_license_valid_codes"] = codes
+    return codes
 
 
 TRIAL_MONTHS = 6  # histórico máximo sincronizable sin licencia activa
@@ -698,7 +715,7 @@ def license_gate() -> str:
         "Código de licencia", value=saved.code,
         help="Lo tienes en el último correo de pago de tu suscripción de Substack.")
     if typed != saved.code:
-        _fetch_valid_codes_cached.clear()  # código nuevo: no esperar a que caduque la caché de 1h
+        st.session_state.pop("_license_valid_codes", None)  # código nuevo: comprobarlo de verdad ya
     st.button("Verificar licencia")  # el propio cambio de campo ya dispara el rerun
 
     attempt = L.LicenseState(code=typed, last_ok=saved.last_ok)
@@ -792,13 +809,18 @@ def _cached_trades(paths: tuple[str, ...], start: str, end: str,
 
 @st.cache_data(show_spinner=False)
 def _cached_portfolio(paths: tuple[str, ...], accounts: tuple[str, ...] | None,
-                      currency: str | None):
+                      currency: str | None, weight_basis: str):
     """Mismo motivo y mismo patrón que _cached_attribute(): T.portfolio()
     (pestaña Cartera) también se recalculaba entero en cada rerun de
-    cualquier pestaña, aunque nadie estuviera mirando Cartera."""
+    cualquier pestaña, aunque nadie estuviera mirando Cartera.
+
+    weight_basis en la clave de caché a propósito: cambiar entre
+    "Patrimonio"/"Exposición" en el selector de la pestaña debe recalcular
+    (el pastel y el peso salen distintos), no reusar el resultado del otro
+    modo."""
     ds = load_paths(paths)
     return T.portfolio(ds, accounts=list(accounts) if accounts else None,
-                       analysis_currency=currency)
+                       analysis_currency=currency, weight_basis=weight_basis)
 
 
 # --------------------------------------------------------------------------
@@ -2018,14 +2040,23 @@ def portfolio_view(ds: P.Dataset, accounts: list[str] | None):
     Métricas — son preguntas distintas (§20.1 aplica el mismo criterio a
     Operaciones)."""
     currency = ds.base_currency
+    section_header("pie-chart", "Cartera")
+    weight_label = st.radio(
+        "Ver pastel y % Peso por…", ["Patrimonio", "Exposición"],
+        horizontal=True, key="portfolio_weight_basis",
+        help="Patrimonio: solo acciones y efectivo, igual que siempre. "
+             "Exposición: añade futuros y opciones (en valor absoluto, largo o "
+             "corto sin compensar) — las 3 cajitas de abajo no cambian con esto, "
+             "solo el pastel y el «% Peso» de la tabla de Posiciones.")
+    weight_basis = "exposicion" if weight_label == "Exposición" else "patrimonio"
+
     snap = _cached_portfolio(st.session_state["paths"],
-                             tuple(accounts) if accounts else None, currency)
+                             tuple(accounts) if accounts else None, currency, weight_basis)
     if not snap.positions and not snap.cash:
         st.info("No hay posiciones abiertas ni efectivo en las cuentas seleccionadas.")
         return
 
     d = snap.as_of
-    section_header("pie-chart", "Cartera")
     st.caption(f"A cierre del {d[6:]}/{d[4:6]}/{d[:4]} · posiciones y efectivo tal cual "
               "los reporta IBKR, en la divisa base de la cuenta — la plusvalía latente es "
               "su propio cálculo (`costBasisPrice`/`fifoPnlUnrealized`), no una "
@@ -2063,13 +2094,22 @@ def portfolio_view(ds: P.Dataset, accounts: list[str] | None):
             st.plotly_chart(fig, use_container_width=True)
 
     st.caption(
-        "**Patrimonio** = acciones + efectivo, en la divisa base de la cuenta. El efectivo "
-        "va combinado en una sola porción del pastel al tipo de cambio vigente (desglosado "
-        "por cuenta y divisa más abajo). **Exposición total** añade el nocional bruto de "
-        "futuros y opciones —largo o corto, sin compensar entre sí— porque un corto expone "
-        "al mercado igual que un largo; no entra en Patrimonio ni en el pastel porque no es "
-        "capital inmovilizado (mismo criterio que el NAV, §2/NON_NAV_CATEGORIES). Ambos "
-        "siguen apareciendo entre las posiciones, con su plusvalía latente.")
+        "**Patrimonio** = acciones + efectivo, en la divisa base de la cuenta. **Exposición "
+        "total** le añade el nocional bruto de futuros y opciones —largo o corto, sin "
+        "compensar entre sí— porque un corto expone al mercado igual que un largo; no es "
+        "capital inmovilizado (mismo criterio que el NAV, §2/NON_NAV_CATEGORIES). Estas dos "
+        "cajitas no cambian con el selector de arriba.")
+    if weight_basis == "exposicion":
+        st.caption(
+            "**Modo Exposición** (pastel y tabla de abajo): futuros y opciones SÍ entran, en "
+            "valor absoluto —un corto pesa igual que un largo, sin compensar— y el % se "
+            "calcula sobre la Exposición total, no sobre el Patrimonio.")
+    else:
+        st.caption(
+            "**Modo Patrimonio** (pastel y tabla de abajo): solo acciones y efectivo. Futuros "
+            "y opciones no entran aquí (no son capital inmovilizado) pero siguen apareciendo "
+            "en la tabla de Posiciones con su plusvalía — cambia a «Exposición» arriba para "
+            "incluirlos en el pastel y el % Peso.")
 
     # Posiciones y efectivo van en DOS tablas, no en una (§21.4). No es sólo
     # estético: el efectivo no tiene precio de entrada ni plusvalía, y esas
@@ -2131,10 +2171,11 @@ def _positions_table(snap):
                     "% Peso": st.column_config.NumberColumn(width=65),
                 })
     st.caption(f"Cantidad negativa = posición corta. **Total** y **% Peso** en la divisa "
-              f"base de análisis ({snap.currency}), sobre el mismo patrimonio total del "
-              "pastel de arriba — no en la divisa local de cada posición (columna Divisa). "
-              "Orden por defecto: de mayor a menor peso. Precio actual, dirección explícita "
-              "y fecha de entrada se han quitado de esta tabla para que quepa sin recortarse.")
+              f"base de análisis ({snap.currency}), sobre la misma base que el pastel de "
+              "arriba (Patrimonio o Exposición, según el selector) — no en la divisa local "
+              "de cada posición (columna Divisa). Orden por defecto: de mayor a menor peso. "
+              "Precio actual, dirección explícita y fecha de entrada se han quitado de esta "
+              "tabla para que quepa sin recortarse.")
 
 
 def _cash_table(snap):

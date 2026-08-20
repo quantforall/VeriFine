@@ -79,8 +79,22 @@ cambio EN VIVO, no solo comprobarlo una vez al cargar.
     }
   }
 
-  detectAndApply();
+  // announce() PRIMERO, detectAndApply() después — y no al revés (como
+  // estaba). Streamlit ignora en silencio cualquier setComponentValue()
+  // que llegue antes de que el componente mande streamlit:componentReady
+  // (visto en producción: el primerísimo detectAndApply(), antes de
+  // announce(), es precisamente el que trae el tema CORRECTO cuando ya
+  // arranca bien detectado — p. ej. "Use system setting" con el sistema en
+  // claro, tras el arreglo de base="dark" en config.toml). Como luego
+  // detectAndApply() solo vuelve a llamar a setValue() cuando el tema
+  // CAMBIA respecto al último que él mismo reportó (lastTheme), si ese
+  // primer aviso se pierde y el tema nunca cambia de verdad durante la
+  // sesión, Python se queda para siempre con su valor por defecto ("dark")
+  // aunque data-vf-theme (que sí se aplica directo sobre el DOM, sin pasar
+  // por este protocolo) ya diga "light" — de ahí que el CSS se viera bien
+  // pero las tablas/el pastel (coloreados en Python) se quedaran oscuros.
   announce();
+  detectAndApply();
 
   // MutationObserver sobre el <body> del padre: Streamlit repinta su
   // fondo (y el resto) ahí mismo al cambiar de tema desde Settings, sin

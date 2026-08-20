@@ -493,7 +493,24 @@ class PortfolioSnapshot:
 
 
 def portfolio(ds: P.Dataset, accounts: list[str] | None = None,
-             analysis_currency: str | None = None, pie_top_n: int = 8) -> PortfolioSnapshot:
+             analysis_currency: str | None = None, pie_top_n: int = 8,
+             weight_basis: str = "patrimonio") -> PortfolioSnapshot:
+    """weight_basis controla el pastel y el "% Peso" de la tabla de
+    Posiciones (a petición expresa — dos formas de ver la misma cartera):
+
+        "patrimonio"  (por defecto) futuros/opciones fuera del pastel y del
+                      peso, igual que siempre — equity_total_analysis_ccy
+                      como denominador.
+        "exposicion"  futuros/opciones SÍ entran en el pastel, en valor
+                      ABSOLUTO (mismo criterio que ya usa exposure_total:
+                      un corto expone al mercado igual que un largo, no se
+                      compensan) — exposure_total_analysis_ccy como
+                      denominador.
+
+    equity_total/exposure_total/notional_total (las 3 cajitas del KPI) NO
+    cambian con esto — son hechos objetivos de la cartera, no una forma de
+    mirarla; solo cambia qué entra en el pastel y sobre qué base se pesa.
+    """
     # top 8 + "Otros" = máximo 9 porciones (a petición expresa: con 5+Otros
     # el bloque "Otros" se comía demasiado del pastel). 9 no es arbitrario:
     # coincide con el número de colores de PIE_COLORS en app.py — subir esto
@@ -601,12 +618,22 @@ def portfolio(ds: P.Dataset, accounts: list[str] | None = None,
             pct_return=pct, value_local=r["value_local"], in_equity_weight=in_weight,
             value_analysis_ccy=value_analysis))
 
+        label = r["symbol"]
         if in_weight:
             equity_total += value_analysis
-            label = r["symbol"]
-            pie_pool[label] = pie_pool.get(label, 0.0) + value_analysis
         else:
             notional_total += abs(value_analysis)
+
+        # Qué entra en el pastel depende del modo (ver docstring). En
+        # "patrimonio", igual que siempre: solo lo que ya cuenta para
+        # equity_total, con su signo. En "exposición" entra TODO, y
+        # futuros/opciones en valor absoluto — mismo criterio que
+        # notional_total: un corto expone igual que un largo.
+        if weight_basis == "exposicion":
+            pool_value = value_analysis if in_weight else abs(value_analysis)
+            pie_pool[label] = pie_pool.get(label, 0.0) + pool_value
+        elif in_weight:
+            pie_pool[label] = pie_pool.get(label, 0.0) + value_analysis
 
     cash_rows: list[CashRow] = []
     cash = ds.cash
@@ -627,22 +654,24 @@ def portfolio(ds: P.Dataset, accounts: list[str] | None = None,
             # detalle (cash_rows, arriba) sigue apareciendo por cuenta/divisa.
             pie_pool["Efectivo"] = pie_pool.get("Efectivo", 0.0) + value_analysis
 
-    # Segunda pasada: equity_total ya está cerrado (incluye el efectivo,
-    # procesado arriba DESPUÉS del bucle de posiciones) — mismo denominador
-    # que usan las porciones del pastel, así que "% Peso" en la tabla y el
-    # "%" de cada porción del pastel significan lo mismo.
+    # Denominador del peso: equity_total en modo "patrimonio" (de siempre),
+    # exposure_total (equity + nocional) en modo "exposición" — ver
+    # docstring. Segunda pasada porque equity_total no está cerrado hasta
+    # sumar el efectivo, procesado arriba DESPUÉS del bucle de posiciones.
+    weight_total = (equity_total + notional_total
+                    if weight_basis == "exposicion" else equity_total)
     for row in rows:
-        row.pct_weight = (100 * row.value_analysis_ccy / equity_total
-                          if equity_total else None)
+        row.pct_weight = (100 * row.value_analysis_ccy / weight_total
+                          if weight_total else None)
 
     ordered = sorted(pie_pool.items(), key=lambda kv: -kv[1])
     top, rest = ordered[:pie_top_n], ordered[pie_top_n:]
     pie = [PieSlice(label=k, value_analysis_ccy=v,
-                    pct=100 * v / equity_total if equity_total else 0.0) for k, v in top]
+                    pct=100 * v / weight_total if weight_total else 0.0) for k, v in top]
     if rest:
         rest_sum = sum(v for _, v in rest)
         pie.append(PieSlice(label="Otros", value_analysis_ccy=rest_sum,
-                            pct=100 * rest_sum / equity_total if equity_total else 0.0))
+                            pct=100 * rest_sum / weight_total if weight_total else 0.0))
 
     return PortfolioSnapshot(as_of=as_of, positions=rows, cash=cash_rows, pie=pie,
                              equity_total_analysis_ccy=equity_total,
