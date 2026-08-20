@@ -552,8 +552,9 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
 [data-baseweb="calendar"] [role="gridcell"][aria-label^="Selected"] * {{
   color: #04140A !important;
 }}
-/* Los días fuera de rango (en modo prueba el campo lleva min_value, así
-   que TODO lo anterior al límite de 6 meses sale deshabilitado) los
+/* Los días fuera de rango (p. ej. el selector "Periodo de análisis": en
+   modo de prueba lleva min_value porque el periodo ANALIZABLE sí está
+   capado a 6 meses, aunque la descarga no lo esté — ver TRIAL_MONTHS) los
    atenúa BaseWeb bajándoles el color: comprobado en una app de prueba con
    min_value, gris rgb(163,168,184) frente al blanco de los elegibles, y
    aria-label que empieza por "Not available" en vez de "Choose". El
@@ -688,15 +689,18 @@ def _fetch_valid_codes_cached() -> list[str] | None:
     return codes
 
 
-TRIAL_MONTHS = 6  # histórico máximo sincronizable sin licencia activa
+TRIAL_MONTHS = 6  # histórico máximo ANALIZABLE sin licencia activa — la
+                  # descarga/sincronización no tiene tope (§_history_start_field)
 
 
 def license_gate() -> str:
     """Nunca bloquea del todo — la conversión pasa por dejar probar la app,
     no por dejarla fuera. Devuelve "full" (licencia válida: sin límites) o
-    "trial" (sin licencia — o caducada, o nunca hubo). sidebar_source() usa
-    "trial" para capar la sincronización a TRIAL_MONTHS meses, y main() para
-    bloquear Efecto divisa/Operaciones/Informe.
+    "trial" (sin licencia — o caducada, o nunca hubo). main() usa "trial"
+    para capar el PERIODO DE ANÁLISIS a TRIAL_MONTHS meses (nunca lo que se
+    puede descargar — a petición expresa, así no hay que resincronizar al
+    activar la licencia, ver _history_start_field) y para bloquear Efecto
+    divisa/Operaciones/Informe.
 
     El campo de licencia se pinta SIEMPRE, no solo cuando falta — así se
     puede introducir o renovar el código en cualquier momento, no solo la
@@ -737,9 +741,10 @@ def license_gate() -> str:
 
     # No autoriza: NO se toca el último código válido guardado — un
     # intento fallido (typo, código de otro mes) no debe borrar el bueno.
-    st.info(f"**Modo de prueba** — histórico limitado a {TRIAL_MONTHS} meses y "
-           "Efecto divisa/Operaciones/Informe bloqueadas hasta verificar la "
-           "licencia. El código está en el último correo de pago de tu "
+    st.info(f"**Modo de prueba** — el análisis se limita a {TRIAL_MONTHS} meses "
+           "(puedes descargar todo el histórico que quieras igualmente) y "
+           "Efecto divisa/Operaciones/Informe quedan bloqueadas hasta verificar "
+           "la licencia. El código está en el último correo de pago de tu "
            "suscripción de Substack.")
     return "trial"
 
@@ -1193,20 +1198,19 @@ def _history_start_field(qid: str, license_mode: str) -> pd.Timestamp:
     state_path = os.path.join(RAW_DIR, f"state_{qid}.json")
     existing_start = SyncState.load(state_path, qid).history_start if qid else ""
 
-    trial_floor = None
     if license_mode == "trial":
         trial_floor = (pd.Timestamp.today().normalize()
                        - pd.DateOffset(months=TRIAL_MONTHS)).date()
-        st.caption(f"Modo de prueba: histórico limitado a los últimos "
-                  f"{TRIAL_MONTHS} meses (desde "
-                  f"{trial_floor.strftime('%d/%m/%Y')}). Con licencia "
-                  "activa se levanta el límite.")
+        # A petición expresa: NO se limita lo que se puede DESCARGAR en modo
+        # de prueba — solo lo que se puede ANALIZAR (ver el capado real en
+        # main(), sobre `funded`). Así, si luego se activa la licencia, ya
+        # está todo sincronizado y no hay que volver a descargar nada.
+        st.caption(f"Modo de prueba: el **análisis** se limita a los últimos "
+                  f"{TRIAL_MONTHS} meses (desde {trial_floor.strftime('%d/%m/%Y')}), "
+                  "pero puedes descargar todo el histórico que quieras desde ya — "
+                  "así no hace falta volver a sincronizar cuando actives tu licencia.")
 
     default_start = pd.Timestamp(existing_start) if existing_start else pd.Timestamp("2023-01-01")
-    if trial_floor is not None:
-        default_start = max(default_start, pd.Timestamp(trial_floor))
-        return st.date_input("Importar histórico desde", default_start,
-                             min_value=trial_floor, format="DD/MM/YYYY")
     return st.date_input("Importar histórico desde", default_start, format="DD/MM/YYYY")
 
 
@@ -1259,7 +1263,10 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
     # `start` ya viene calculado de _history_start_field(), dentro del
     # expander "Conexión y licencia" (§main) — aquí solo se usa. La única
     # razón para seguir sabiendo si hay modo de prueba es el aviso de más
-    # abajo, en el botón "Sincronizar".
+    # abajo, en el botón "Sincronizar" — la descarga en sí NO se limita en
+    # modo de prueba (a petición expresa: solo el análisis, capado de
+    # verdad en main() sobre `funded`), para no obligar a re-sincronizar
+    # cuando se active la licencia.
     trial_floor = ((pd.Timestamp.today().normalize() - pd.DateOffset(months=TRIAL_MONTHS)).date()
                    if license_mode == "trial" else None)
 
@@ -1289,9 +1296,10 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
         from q4_sync import backfill
 
         if trial_floor is not None:
-            st.warning(f"Sin licencia activa: la descarga se limita a los últimos "
-                       f"{TRIAL_MONTHS} meses (desde {trial_floor.strftime('%d/%m/%Y')}). "
-                       "Verifica tu licencia en el sidebar para levantar el límite.")
+            st.info(f"Sin licencia activa: puedes descargar todo el histórico que "
+                    f"quieras, pero el **análisis** se limita a los últimos "
+                    f"{TRIAL_MONTHS} meses (desde {trial_floor.strftime('%d/%m/%Y')}) "
+                    "hasta que verifiques tu licencia en el sidebar.")
 
         # Candado por query: el limitador de ritmo de FlexClient (1 req/s,
         # 10/min) vive EN MEMORIA, dentro de esa instancia — no es global. Si
@@ -2041,13 +2049,17 @@ def portfolio_view(ds: P.Dataset, accounts: list[str] | None):
     Operaciones)."""
     currency = ds.base_currency
     section_header("pie-chart", "Cartera")
-    weight_label = st.radio(
-        "Ver pastel y % Peso por…", ["Patrimonio", "Exposición"],
-        horizontal=True, key="portfolio_weight_basis",
+    # st.segmented_control, no st.radio — mismo formato de botones que ya usa
+    # el selector "Gráfico" (Curva de capital/Drawdown) en Métricas, para que
+    # los dos selectores de la app se vean iguales. Puede devolver None si se
+    # deselecciona (clic otra vez sobre el ya activo) — de ahí el `or`.
+    weight_label = st.segmented_control(
+        "Visualizar por", ["Patrimonio", "Exposición"],
+        default="Patrimonio", key="portfolio_weight_basis",
         help="Patrimonio: solo acciones y efectivo, igual que siempre. "
              "Exposición: añade futuros y opciones (en valor absoluto, largo o "
              "corto sin compensar) — las 3 cajitas de abajo no cambian con esto, "
-             "solo el pastel y el «% Peso» de la tabla de Posiciones.")
+             "solo el pastel y el «% Peso» de la tabla de Posiciones.") or "Patrimonio"
     weight_basis = "exposicion" if weight_label == "Exposición" else "patrimonio"
 
     snap = _cached_portfolio(st.session_state["paths"],
@@ -2429,8 +2441,9 @@ def configuracion_view():
                 "El código llega en el <strong>último correo de pago</strong> de tu "
                 "suscripción de Substack. Pégalo en el campo <strong>Licencia</strong>, "
                 "arriba del todo en el lateral, y pulsa «Verificar licencia». Sin él "
-                "puedes seguir probando: sincronizas hasta 6 meses de histórico y ves "
-                "Métricas y Cartera, pero Efecto divisa, Operaciones e Informe quedan "
+                "puedes seguir probando: sincroniza todo el histórico que quieras "
+                "(así no hay que repetirlo luego), pero Métricas solo analiza los "
+                "últimos 6 meses, y Efecto divisa, Operaciones e Informe quedan "
                 "bloqueadas hasta verificarlo.")
 
     _guide_step("03", "layers", "Crea la Flex Query en el Client Portal",
@@ -2608,12 +2621,36 @@ def main():
             st.caption("Comprobaciones de integridad superadas: el NAV reconstruye por "
                        "cuenta, la atribución cierra y es invariante a la moneda.")
 
-        funded = analyzable_dates(ds, accounts or None)
+        funded_all = analyzable_dates(ds, accounts or None)
+
+        # Sin licencia activa, el periodo analizable se capa a los últimos
+        # TRIAL_MONTHS SIEMPRE — independientemente de cuánto histórico haya
+        # ya descargado/sincronizado (p. ej. de cuando la licencia sí estaba
+        # activa, o de un backfill hecho antes de verificarla). Se filtra
+        # `funded` aquí, antes de que nada más lo use (slider, date_input,
+        # el "else" de más abajo) — así el tope se respeta pase lo que pase
+        # por debajo, no solo cuando el slider tiene rango de sobra.
+        funded = funded_all
+        if license_mode == "trial":
+            trial_floor_s = (pd.Timestamp.today().normalize()
+                             - pd.DateOffset(months=TRIAL_MONTHS)).strftime("%Y%m%d")
+            funded = [d for d in funded_all if d >= trial_floor_s]
+
         if len(funded) < 2:
-            st.warning("No hay histórico con NAV positivo suficiente para analizar.")
+            st.warning("No hay histórico con NAV positivo suficiente para analizar."
+                       if license_mode == "full" else
+                       f"Sin licencia activa, solo se pueden analizar los últimos "
+                       f"{TRIAL_MONTHS} meses — y en ese tramo no hay histórico con NAV "
+                       "positivo suficiente. Verifica tu licencia en el lateral para "
+                       "levantar el límite.")
             st.stop()
 
-        if funded[0] > ds.dates[0]:
+        if license_mode == "trial" and funded[0] > funded_all[0]:
+            st.info(f"Sin licencia activa: análisis limitado a los últimos {TRIAL_MONTHS} "
+                    f"meses (desde {funded[0][6:]}/{funded[0][4:6]}/{funded[0][:4]}), aunque "
+                    "tengas más sincronizado. Verifica tu licencia en el lateral para "
+                    "levantar el límite.")
+        elif funded[0] > ds.dates[0]:
             st.info(f"Los datos arrancan con NAV positivo el {funded[0][6:]}/{funded[0][4:6]}/"
                     f"{funded[0][:4]}; los días previos al fondeo no son calculables (§9).")
 
