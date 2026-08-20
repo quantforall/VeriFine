@@ -2138,19 +2138,13 @@ def portfolio_view(ds: P.Dataset, accounts: list[str] | None):
             "el % Peso, ni en la tabla de Posiciones — cambia a «Exposición» arriba para "
             "verlos.")
 
-    # Posiciones y efectivo van en DOS tablas, no en una (§21.4). No es sólo
-    # estético: el efectivo no tiene precio de entrada ni plusvalía, y esas
-    # celdas vacías salían como "None" —comprobado: Streamlit pinta "None"
-    # para todo NaN numérico, ignorando el formateo del Styler, `na_rep` y
-    # `NumberColumn`; la única forma de no verlo es que la columna no exista—.
-    # De paso, dos tablas estrechas caben sin scroll horizontal donde una de
-    # 13 columnas no cabía, que es por lo que "Plusvalía" y "%" no se veían.
-    if snap.positions:
+    # A petición expresa, el efectivo entra como filas más de ESTA MISMA
+    # tabla (antes iba en una tabla "Efectivo" aparte, §21.4 original) — una
+    # fila por DIVISA, combinando todas las cuentas visibles, para que
+    # compita en el mismo orden por "% Peso" que las acciones/futuros.
+    if snap.positions or snap.cash:
         section_header("layers", "Posiciones")
         _positions_table(snap, weight_basis)
-    if snap.cash:
-        section_header("activity", "Efectivo")
-        _cash_table(snap)
 
 
 def _positions_table(snap, weight_basis):
@@ -2179,51 +2173,99 @@ def _positions_table(snap, weight_basis):
         # tampoco aparezcan aquí, para no sugerir un peso sobre un total
         # del que en realidad están excluidos. En Exposición sí entran.
         positions = [p for p in positions if p.in_equity_weight]
-    if not positions:
-        st.caption("Sin acciones ni efectivo en las cuentas seleccionadas — cambia a "
-                  "«Exposición» arriba para ver futuros/opciones.")
+    if not positions and not snap.cash:
+        st.caption("Sin acciones, futuros/opciones ni efectivo en las cuentas "
+                  "seleccionadas.")
         return
 
+    # Efectivo, combinado por DIVISA (a petición expresa: una fila por
+    # divisa, sumando todas las cuentas visibles — no una fila por
+    # cuenta+divisa). pct_weight es lineal en value_analysis_ccy (mismo
+    # weight_total para toda la cartera), así que sumar los % ya calculados
+    # por fila da el mismo resultado que recalcular sobre la suma — no
+    # hace falta que este bloque sepa nada de equity_total/exposure_total.
+    cash_by_ccy: dict[str, dict] = {}
+    for c in snap.cash:
+        agg = cash_by_ccy.setdefault(c.currency, {"balance": 0.0, "total": 0.0, "pct": 0.0})
+        agg["balance"] += c.balance_local
+        agg["total"] += c.value_analysis_ccy
+        agg["pct"] += c.pct_weight or 0.0
+
+    # "None" en vez del valor vacío: comprobado en vivo que st.dataframe
+    # pinta "None" para todo NaN numérico en una NumberColumn, ignorando el
+    # formateo de pandas.Styler, `na_rep` y el propio `format=` de
+    # NumberColumn (por eso Posiciones/Efectivo iban antes en dos tablas
+    # separadas, §21.4 original) — la única forma real de que la celda
+    # salga en blanco es que la columna no sea numérica ahí. Por eso
+    # Cantidad/Precio entrada/Plusvalía/% se formatean aquí a TEXTO ya
+    # resuelto (vacío para efectivo) en vez de dejarlos como float con NaN;
+    # el color de Plusvalía/% se calcula aparte, a partir de dos columnas
+    # ocultas con el valor numérico crudo (_raw_gain/_raw_pct), porque una
+    # vez convertidas a texto ya no se puede colorear por signo numérico
+    # directamente sobre esas mismas columnas.
+    def _txt(v, signed=False):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
+        return f"{v:+,.2f}" if signed else f"{v:,.2f}"
+
     total_col = f"Total ({snap.currency})"
-    pos_df = pd.DataFrame([dict(
+    rows = [dict(
         Cuenta=p.account, Ticker=p.symbol, Tipo=p.kind.capitalize(),
-        Divisa=p.currency, Cantidad=p.quantity,
-        **{"Precio entrada": p.entry_price},
-        **{"Plusvalía": p.unrealized_gain_local},
-        **{"%": p.pct_return * 100 if p.pct_return is not None else None},
-        **{total_col: p.value_analysis_ccy},
-        **{"% Peso": p.pct_weight},
-    ) for p in positions]).sort_values("% Peso", ascending=False)
-    # "Cantidad" y "Total"/"% Peso" NO van en signed: un corto es negativo
+        Divisa=p.currency, Cantidad=_txt(p.quantity),
+        **{"Precio entrada": _txt(p.entry_price)},
+        **{"Plusvalía": _txt(p.unrealized_gain_local, signed=True)},
+        **{"%": _txt(p.pct_return * 100 if p.pct_return is not None else None, signed=True)},
+        **{total_col: p.value_analysis_ccy, "% Peso": p.pct_weight},
+        _raw_gain=p.unrealized_gain_local,
+        _raw_pct=p.pct_return * 100 if p.pct_return is not None else None,
+    ) for p in positions]
+    rows += [dict(
+        Cuenta="Todas", Ticker=ccy, Tipo="Efectivo",
+        Divisa=ccy, Cantidad=_txt(agg["balance"]),
+        **{"Precio entrada": "", "Plusvalía": "", "%": ""},
+        **{total_col: agg["total"], "% Peso": agg["pct"]},
+        _raw_gain=None, _raw_pct=None,
+    ) for ccy, agg in sorted(cash_by_ccy.items())]
+
+    pos_df = pd.DataFrame(rows).sort_values("% Peso", ascending=False)
+
+    def _row_colors(row):
+        out = {c: "" for c in row.index}
+        for col, raw_col in (("Plusvalía", "_raw_gain"), ("%", "_raw_pct")):
+            raw = row[raw_col]
+            if raw is not None and pd.notna(raw):
+                out[col] = f"color:{POS if raw >= 0 else NEG}"
+        return pd.Series(out)
+
+    # "Cantidad" y "Total"/"% Peso" NO van coloreados: un corto es negativo
     # por convención (o representa un pasivo en Total), no una pérdida —
     # colorearlos en rojo confundiría dirección/magnitud con resultado.
-    st.dataframe(style(pos_df, ["Plusvalía", "%"]), width='stretch', hide_index=True,
+    sty = (pos_df.style
+          .apply(_row_colors, axis=1)
+          .format({total_col: lambda v: "—" if pd.isna(v) else f"{v:,.2f}",
+                   "% Peso": lambda v: "—" if pd.isna(v) else f"{v:,.2f}"})
+          .set_properties(**{"background-color": CARD, "color": FG}))
+    st.dataframe(sty, width='stretch', hide_index=True,
                 column_config={
                     "Cuenta": st.column_config.TextColumn(width=80),
                     "Ticker": st.column_config.TextColumn(width=60),
                     "Tipo": st.column_config.TextColumn(width=65),
                     "Divisa": st.column_config.TextColumn(width=52),
-                    "Cantidad": st.column_config.NumberColumn(width=65),
-                    "Precio entrada": st.column_config.NumberColumn(width=85),
-                    "Plusvalía": st.column_config.NumberColumn(width=85),
-                    "%": st.column_config.NumberColumn(width=55),
+                    "Cantidad": st.column_config.TextColumn(width=65),
+                    "Precio entrada": st.column_config.TextColumn(width=85),
+                    "Plusvalía": st.column_config.TextColumn(width=85),
+                    "%": st.column_config.TextColumn(width=55),
                     total_col: st.column_config.NumberColumn(width=95),
                     "% Peso": st.column_config.NumberColumn(width=65),
+                    "_raw_gain": None, "_raw_pct": None,
                 })
     st.caption(f"Cantidad negativa = posición corta. **Total** y **% Peso** en la divisa "
               f"base de análisis ({snap.currency}), sobre la misma base que el pastel de "
               "arriba (Patrimonio o Exposición, según el selector) — no en la divisa local "
-              "de cada posición (columna Divisa). Orden por defecto: de mayor a menor peso. "
-              "Precio actual, dirección explícita y fecha de entrada se han quitado de esta "
-              "tabla para que quepa sin recortarse.")
-
-
-def _cash_table(snap):
-    cash_df = pd.DataFrame([dict(Cuenta=c.account, Divisa=c.currency,
-                                Saldo=c.balance_local) for c in snap.cash])
-    st.dataframe(style(cash_df, []), width='stretch', hide_index=True,
-                column_config={c: st.column_config.TextColumn(width="small")
-                               for c in ("Cuenta", "Divisa")})
+              "de cada fila (columna Divisa). Efectivo combinado por divisa, todas las "
+              "cuentas visibles. Orden por defecto: de mayor a menor peso. Precio actual, "
+              "dirección explícita y fecha de entrada se han quitado de esta tabla para "
+              "que quepa sin recortarse.")
 
 
 def _fx_sum_by_currency(rows: pd.DataFrame, amount_col: str, ds: P.Dataset,

@@ -472,6 +472,8 @@ class CashRow:
     account: str
     currency: str
     balance_local: float
+    value_analysis_ccy: float = 0.0  # balance_local convertido a la divisa de análisis
+    pct_weight: float | None = None  # mismo denominador/segunda pasada que PositionRow
 
 
 @dataclass
@@ -645,9 +647,10 @@ def portfolio(ds: P.Dataset, accounts: list[str] | None = None,
         for _, r in cash.iterrows():
             if abs(r["balance_local"]) < 0.01:
                 continue
-            cash_rows.append(CashRow(account=r["account"], currency=r["currency"],
-                                     balance_local=r["balance_local"]))
             value_analysis = to_analysis(r["balance_local"], r["currency"], r["date"])
+            cash_rows.append(CashRow(account=r["account"], currency=r["currency"],
+                                     balance_local=r["balance_local"],
+                                     value_analysis_ccy=value_analysis))
             equity_total += value_analysis
             # §21.3 — en el pastel el efectivo va combinado en una sola porción
             # al tipo de cambio vigente, sea la divisa que sea; en la tabla de
@@ -661,6 +664,9 @@ def portfolio(ds: P.Dataset, accounts: list[str] | None = None,
     weight_total = (equity_total + notional_total
                     if weight_basis == "exposicion" else equity_total)
     for row in rows:
+        row.pct_weight = (100 * row.value_analysis_ccy / weight_total
+                          if weight_total else None)
+    for row in cash_rows:
         row.pct_weight = (100 * row.value_analysis_ccy / weight_total
                           if weight_total else None)
 
