@@ -330,32 +330,53 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
   border-color: var(--border) !important;
 }}
 
+/* El calendario desplegable de st.date_input (se abre al pulsar el campo,
+   no es el campo en sí — ese ya va cubierto arriba con stDateInputField)
+   tiene el MISMO problema en Streamlit Cloud: fondo blanco puro y el
+   círculo del día elegido en el rojo por defecto de Streamlit. No expone
+   ningún data-testid en las celdas — solo [data-baseweb="calendar"] en el
+   contenedor y, en la celda del día elegido, un aria-label que empieza
+   por "Selected" (confirmado inspeccionando el DOM real; el círculo en sí
+   es un ::after de esa celda, no un fondo normal — por eso hace falta
+   apuntar directamente al pseudo-elemento). */
+[data-baseweb="calendar"], [data-baseweb="popover"] {{
+  background-color: var(--card) !important;
+  color: var(--fg) !important;
+  border-color: var(--border) !important;
+}}
+[data-baseweb="calendar"] button {{
+  color: var(--fg) !important;
+}}
+[data-baseweb="calendar"] [role="gridcell"][aria-label^="Selected"]::after {{
+  background-color: var(--color-positive) !important;
+}}
+
 /* primaryColor (#22C55E) tampoco se aplica en Streamlit Cloud en varios
    sitios nativos — sale el rojo por defecto de Streamlit (#FF4B4B) en su
    lugar: pestaña activa, botón activo de un segmented_control, chips de
    un multiselect y la casilla marcada de un checkbox. Mismo patrón que el
    fondo blanco de arriba: se fuerza aquí en vez de fiarse del tema. */
 [data-testid="stTab"][aria-selected="true"] {{
-  border-bottom-color: var(--pos) !important;
-  color: var(--pos) !important;
+  border-bottom-color: var(--color-positive) !important;
+  color: var(--color-positive) !important;
 }}
 .react-aria-SelectionIndicator {{
-  background-color: var(--pos) !important;
+  background-color: var(--color-positive) !important;
 }}
 [data-testid="stButtonGroup"] button[aria-pressed="true"] {{
   background-color: rgba(34,197,94,.1) !important;
-  border-color: var(--pos) !important;
-  color: var(--pos) !important;
+  border-color: var(--color-positive) !important;
+  color: var(--color-positive) !important;
 }}
 [data-testid="stMultiSelectTagsContainer"] span[role="group"] {{
-  background-color: var(--pos) !important;
+  background-color: var(--color-positive) !important;
   color: #04140A !important;
 }}
 [data-testid="stMultiSelectTagsContainer"] span[role="group"] svg {{
   color: #04140A !important;
 }}
 [data-testid="stCheckbox"] [data-selected="true"] * {{
-  background-color: var(--pos) !important;
+  background-color: var(--color-positive) !important;
 }}
 
 /* Mismo patrón otra vez, ahora en la CABECERA de un expander (el "▷
@@ -572,9 +593,31 @@ def _connection_fields() -> tuple[str, str]:
     # index.html.
     picker_kwargs["want_restore"] = not bool(glob.glob(os.path.join(RAW_DIR, "*.xml")))
 
+    # "Borrar todo" (§_danger_zone) deja esto pendiente para el rerun
+    # siguiente al suyo propio — session_state.clear() no lo borra porque
+    # se pone DESPUÉS de esa llamada.
+    if st.session_state.pop("_wipe_folder_pending", False):
+        picker_kwargs["wipe_folder"] = True
+
     picker = _folder_picker(**picker_kwargs)
     if picker and picker.get("picked"):
         st.session_state["chosen_folder_name"] = picker["name"]
+        # La carpeta se acaba de confirmar (elegida, recordada o
+        # reconfirmada) en ESTA sesión de navegador por primera vez: copia
+        # también TODO lo que el servidor ya tuviera de antes, no solo lo
+        # que se descargue de aquí en adelante — así "Elegir carpeta" dejar
+        # la carpeta al día con el histórico completo, tal y como se pidió.
+        # Sin `qid` el nombre del fichero de estado no se puede componer
+        # todavía; se reintenta en el siguiente rerun (picker.get("picked")
+        # se queda en True indefinidamente — Streamlit no limpia el valor
+        # de un componente entre reruns — así que esto no se pierde).
+        if qid and not st.session_state.get("_folder_seeded"):
+            st.session_state["_folder_seeded"] = True
+            existing = sorted(glob.glob(os.path.join(RAW_DIR, "*.xml")))
+            if existing:
+                state_path = os.path.join(RAW_DIR, f"state_{qid}.json")
+                _queue_folder_write(existing, state_path)
+                st.rerun()
     if picker and picker.get("wrote") is not None:
         if picker["wrote"] > 0:
             st.caption(f"✓ Copia guardada en tu carpeta: "
@@ -582,6 +625,11 @@ def _connection_fields() -> tuple[str, str]:
         if picker.get("errors"):
             st.caption("⚠ Algunos no se pudieron guardar: " +
                       "; ".join(picker["errors"][:3]))
+    if picker and picker.get("wiped") is not None:
+        st.caption(f"🗑 Carpeta vaciada: {picker['wiped']} fichero(s) borrados.")
+        if picker.get("wipe_errors"):
+            st.caption("⚠ Algunos no se pudieron borrar: " +
+                      "; ".join(picker["wipe_errors"][:3]))
     if picker and picker.get("restored_files"):
         _restore_from_folder(picker["restored_files"])
 
@@ -626,17 +674,23 @@ def _restore_from_folder(files: list[dict]) -> None:
 
 def _danger_zone():
     """Borra TODO (extractos, estado de sincronización, credenciales
-    recordadas, licencia) — para empezar de cero. Mismo sitio que
-    _connection_fields(): dentro del expander colapsable de main()."""
+    recordadas, licencia, y — si hay carpeta elegida — su contenido
+    también) — para empezar de cero. Mismo sitio que _connection_fields():
+    dentro del expander colapsable de main()."""
     st.divider()
     st.caption("Borra todos los extractos descargados, el estado de "
-              "sincronización, el token/Query ID recordados en este equipo "
-              "y el código de licencia. No se puede deshacer — la próxima "
-              "vez hay que sincronizar desde cero.")
+              "sincronización, el token/Query ID recordados en este equipo, "
+              "el código de licencia y — si has elegido carpeta — los "
+              "extractos que tengas guardados ahí. No se puede deshacer — "
+              "la próxima vez hay que sincronizar desde cero.")
     confirm_wipe = st.checkbox("Confirmo que quiero borrarlo todo", key="confirm_wipe_all")
     if st.button("Borrar todo y empezar de nuevo", disabled=not confirm_wipe):
         shutil.rmtree(RAW_DIR, ignore_errors=True)
         st.session_state.clear()
+        # DESPUÉS de clear() a propósito — si no, se borraría a sí mismo
+        # antes de que _connection_fields() llegue a leerlo en el próximo
+        # rerun (ver picker_kwargs["wipe_folder"] ahí).
+        st.session_state["_wipe_folder_pending"] = True
         st.rerun()
 
 

@@ -15,7 +15,12 @@ del navegador), pero eso es un clic ligero ("Confirmar acceso"), no
 volver a elegir la carpeta entera — y, si Python arranca sin datos (arg
 `want_restore`, contenedor efímero de Streamlit Cloud reiniciado), le
 devuelve lo que haya en la carpeta ANTES de que la app compruebe qué
-falta contra IBKR.
+falta contra IBKR. Al elegir/confirmar carpeta, también copia de una vez
+TODO lo que el servidor ya tuviera (arg implícito: la propia confirmación
+de "picked"), no solo lo nuevo — y si el usuario pide "Borrar todo y
+empezar de nuevo" (arg `wipe_folder`), borra de la carpeta los mismos
+ficheros que gestiona (.xml y state_*.json), nunca nada más que hubiera
+ahí.
 -->
 <!doctype html>
 <html lang="es">
@@ -136,6 +141,35 @@ falta contra IBKR.
     }
     setValue({supported: true, picked: true, name: folderHandle.name,
              wrote, total: files.length, errors});
+  }
+
+  // "Borrar todo y empezar de nuevo" (§_danger_zone en app.py) también
+  // vacía la carpeta elegida, no solo RAW_DIR del servidor — a petición
+  // expresa: si el usuario borra el histórico entero, la copia de la
+  // carpeta debe quedar igual de vacía. Solo toca los ficheros con el
+  // MISMO patrón que escriben writeFiles()/leen readAllForRestore()
+  // (.xml y state_*.json) — nunca borra nada más que hubiera en esa
+  // carpeta, por si el usuario la comparte con otra cosa.
+  async function wipeFolder() {
+    if (!folderHandle) return;
+    const toRemove = [];
+    for await (const [name, handle] of folderHandle.entries()) {
+      if (handle.kind !== "file") continue;
+      if (!(name.endsWith(".xml") || (name.startsWith("state_") && name.endsWith(".json")))) continue;
+      toRemove.push(name);
+    }
+    let wiped = 0;
+    const wipeErrors = [];
+    for (const name of toRemove) {
+      try {
+        await folderHandle.removeEntry(name);
+        wiped++;
+      } catch (e) {
+        wipeErrors.push(`${name}: ${e.message}`);
+      }
+    }
+    setValue({supported: true, picked: true, name: folderHandle.name,
+             wiped, wipe_errors: wipeErrors});
   }
 
   // --- Paso 3/3: restaurar al entrar -------------------------------------
@@ -306,6 +340,7 @@ falta contra IBKR.
     const args = event.data.args || {};
     const files = args.files_to_write;
     if (files && files.length && folderHandle) writeFiles(files);
+    if (args.wipe_folder && folderHandle) wipeFolder();
     // Python pone want_restore=true mientras RAW_DIR siga vacío en el
     // servidor. folderHandle puede llegar a estar listo ANTES de que este
     // primer "render" traiga los args (recuerdo en silencio, ver el IIFE
