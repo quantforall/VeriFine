@@ -39,16 +39,70 @@ st.set_page_config(page_title="VeriFine", page_icon=":bar_chart:", layout="wide"
 # --------------------------------------------------------------------------
 # Sistema de diseño — tokens semánticos (no hex sueltos en componentes)
 # --------------------------------------------------------------------------
-BG, PANEL, CARD = "#020617", "#0F172A", "#0E1223"
-FG, MUTED, BORDER = "#F8FAFC", "#94A3B8", "#334155"
-POS, NEG, SERIES = "#22C55E", "#EF4444", "#38BDF8"   # verde, rojo, azul (serie neutra)
-BENCH = "#F59E0B"                                     # ámbar: serie de REFERENCIA (benchmark),
-GRID = "rgba(51,65,85,0.45)"                          # subordinada; distinta de verde/azul/rojo
-#                                                       (color + línea punteada, no sólo color)
+# Dos paletas completas, no solo "invertir" la oscura: el claro necesita
+# tonos más OSCUROS de verde/rojo/azul/ámbar que el oscuro para mantener
+# contraste sobre blanco (un #22C55E que resalta sobre #020617 se ve lavado
+# sobre #FFFFFF) — mismo criterio en toda la tabla, aprox. un escalón más
+# oscuro en la escala Tailwind (500 -> 600) para cada acento.
+_PALETTE_DARK = dict(
+    BG="#020617", PANEL="#0F172A", CARD="#0E1223",
+    FG="#F8FAFC", MUTED="#94A3B8", BORDER="#334155",
+    POS="#22C55E", NEG="#EF4444", SERIES="#38BDF8", BENCH="#F59E0B",
+    GRID="rgba(51,65,85,0.45)",
+)
+_PALETTE_LIGHT = dict(
+    BG="#F8FAFC", PANEL="#F1F5F9", CARD="#FFFFFF",
+    FG="#0F172A", MUTED="#64748B", BORDER="#E2E8F0",
+    POS="#16A34A", NEG="#DC2626", SERIES="#0284C7", BENCH="#D97706",
+    GRID="rgba(148,163,184,0.35)",
+)
+# Los nombres sueltos (BG, PANEL, CARD...) son los que usa el resto del
+# fichero (Plotly, pandas.Styler, PIE_COLORS...) — arrancan en oscuro, el
+# tema por defecto, y _apply_theme_palette() los REASIGNA en caliente al
+# principio de main() en cuanto se sabe qué tema tiene el navegador (ver su
+# docstring: el CSS puro no basta para lo que Python pinta de antemano,
+# como las celdas de una tabla o las líneas de un gráfico).
+BG, PANEL, CARD = _PALETTE_DARK["BG"], _PALETTE_DARK["PANEL"], _PALETTE_DARK["CARD"]
+FG, MUTED, BORDER = _PALETTE_DARK["FG"], _PALETTE_DARK["MUTED"], _PALETTE_DARK["BORDER"]
+POS, NEG, SERIES = _PALETTE_DARK["POS"], _PALETTE_DARK["NEG"], _PALETTE_DARK["SERIES"]
+BENCH = _PALETTE_DARK["BENCH"]
+GRID = _PALETTE_DARK["GRID"]
 
-# Paleta cualitativa del pastel de Cartera (§21): SERIES/BENCH/POS ya
-# existen y se reutilizan primero; el resto son tonos nuevos, mismo nivel de
-# saturación (Tailwind ~500) para no desentonar en el tema OLED.
+
+def _apply_theme_palette(theme: str) -> None:
+    """Reasigna BG/PANEL/CARD/FG/MUTED/BORDER/POS/NEG/SERIES/BENCH/GRID (y
+    PIE_COLORS, que se recalcula de los mismos) al vuelo, según el tema que
+    ha detectado el componente theme_watcher en ESTE rerun.
+
+    Por qué hace falta esto y no basta con CSS: el CSS (THEME_CSS,
+    [data-vf-theme="light"]) cubre TODO lo que el navegador pinta —
+    inputs, botones, calendario, slider, tarjetas — porque esas reglas usan
+    var(--bg) etc. y el navegador las reevalúa solo al cambiar de tema. Pero
+    dos cosas las decide PYTHON de antemano, antes de que el navegador sepa
+    nada: el color de cada celda de st.dataframe (pandas.Styler genera un
+    style= por celda en el HTML, y Streamlit lo traduce a píxeles de
+    <canvas> tal cual se lo den) y el color de cada línea de un gráfico de
+    Plotly (va incrustado en el propio JSON de la figura). Sin esto, tablas
+    y gráficos se quedarían siempre en un tema fijo pasara lo que pasara
+    con el resto de la app.
+
+    Llamar ANTES de construir ninguna tabla o gráfico en main() — Python
+    resuelve los nombres globales en el momento de USARLOS, no al definir
+    la función que los usa, así que esto vale mientras se llame a tiempo."""
+    global BG, PANEL, CARD, FG, MUTED, BORDER, POS, NEG, SERIES, BENCH, GRID, PIE_COLORS
+    p = _PALETTE_LIGHT if theme == "light" else _PALETTE_DARK
+    BG, PANEL, CARD = p["BG"], p["PANEL"], p["CARD"]
+    FG, MUTED, BORDER = p["FG"], p["MUTED"], p["BORDER"]
+    POS, NEG, SERIES = p["POS"], p["NEG"], p["SERIES"]
+    BENCH = p["BENCH"]
+    GRID = p["GRID"]
+    # Paleta cualitativa del pastel de Cartera (§21): SERIES/BENCH/POS ya
+    # existen y se reutilizan primero; el resto son tonos de acento fijos
+    # (no hace falta variante por tema — su saturación media ya se lee bien
+    # tanto en blanco como en el OLED oscuro).
+    PIE_COLORS = [SERIES, BENCH, POS, "#A78BFA", "#F472B6", "#2DD4BF", "#FB923C", "#818CF8", MUTED]
+
+
 PIE_COLORS = [SERIES, BENCH, POS, "#A78BFA", "#F472B6", "#2DD4BF", "#FB923C", "#818CF8", MUTED]
 
 # Por defecto, una ruta estable en el home del usuario — no relativa al
@@ -94,6 +148,13 @@ def _clear_ibkr_creds() -> None:
 _folder_picker = components.declare_component(
     "folder_picker",
     path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "components", "folder_picker"))
+# Invisible (0px): detecta si el navegador tiene Streamlit en claro u
+# oscuro (Settings -> "Choose app theme") y lo cuenta a los dos lados que
+# lo necesitan — ver su docstring en index.html y _apply_theme_palette()
+# más arriba.
+_theme_watcher = components.declare_component(
+    "theme_watcher",
+    path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "components", "theme_watcher"))
 # Candado de sincronización: por encima de esto se asume que el proceso que
 # lo dejó ya no existe (colgado o muerto), no que sigue corriendo de verdad.
 # Más que de sobra para un backfill normal (minutos), corto para no dejar el
@@ -105,9 +166,25 @@ THEME_CSS = f"""
 @import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@300;400;500;600;700&display=swap');
 
 :root {{
-  --bg:{BG}; --panel:{PANEL}; --card:{CARD}; --fg:{FG}; --muted:{MUTED};
-  --border:{BORDER}; --color-positive:{POS}; --color-negative:{NEG};
-  --color-neutral:{FG}; --ring:#FFFFFF;
+  --bg:{_PALETTE_DARK["BG"]}; --panel:{_PALETTE_DARK["PANEL"]}; --card:{_PALETTE_DARK["CARD"]};
+  --fg:{_PALETTE_DARK["FG"]}; --muted:{_PALETTE_DARK["MUTED"]};
+  --border:{_PALETTE_DARK["BORDER"]}; --color-positive:{_PALETTE_DARK["POS"]};
+  --color-negative:{_PALETTE_DARK["NEG"]}; --color-neutral:{_PALETTE_DARK["FG"]}; --ring:#FFFFFF;
+  --series:{_PALETTE_DARK["SERIES"]}; --bench:{_PALETTE_DARK["BENCH"]};
+}}
+/* El oscuro de arriba es el que arranca por defecto (nadie ha tocado el
+   tema todavía, o theme_watcher aún no ha llegado a avisar de nada — ver
+   su componente). En cuanto el navegador tiene Streamlit en claro,
+   theme_watcher pone data-vf-theme="light" en <html> y ESTE bloque toma
+   el relevo: todo lo demás de esta hoja de estilos usa var(--bg) etc, así
+   que no hace falta duplicar ninguna regla más abajo — solo estos
+   tokens. */
+html[data-vf-theme="light"] {{
+  --bg:{_PALETTE_LIGHT["BG"]}; --panel:{_PALETTE_LIGHT["PANEL"]}; --card:{_PALETTE_LIGHT["CARD"]};
+  --fg:{_PALETTE_LIGHT["FG"]}; --muted:{_PALETTE_LIGHT["MUTED"]};
+  --border:{_PALETTE_LIGHT["BORDER"]}; --color-positive:{_PALETTE_LIGHT["POS"]};
+  --color-negative:{_PALETTE_LIGHT["NEG"]}; --color-neutral:{_PALETTE_LIGHT["FG"]}; --ring:#0F172A;
+  --series:{_PALETTE_LIGHT["SERIES"]}; --bench:{_PALETTE_LIGHT["BENCH"]};
 }}
 
 /* !important en estas reglas base a propósito, no por costumbre: hasta
@@ -123,7 +200,7 @@ THEME_CSS = f"""
 .stApp {{ background: var(--bg) !important; }}
 html, body, [data-testid="stAppViewContainer"], .stMarkdown, p, span, label, div {{
   font-family: 'Fira Sans', system-ui, sans-serif;
-  color: var(--fg) !important;
+  color: var(--fg);
 }}
 h1, h2, h3, h4, [data-testid="stMetricValue"] {{ font-family: 'Fira Code', ui-monospace, monospace; }}
 [data-testid="stSidebar"] {{
@@ -189,8 +266,8 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
 .vf-value-row .vf-value {{ margin-top:0; white-space:nowrap; }}
 .vf-verdict-badge {{ display:inline-flex; align-items:center; justify-content:center;
   width:34px; height:34px; border-radius:50%; flex:0 0 auto; }}
-.vf-verdict-badge.vf-pos-bg {{ background:rgba(34,197,94,0.18); color:{POS}; }}
-.vf-verdict-badge.vf-neg-bg {{ background:rgba(239,68,68,0.18); color:{NEG}; }}
+.vf-verdict-badge.vf-pos-bg {{ background:rgba(34,197,94,0.18); color:var(--color-positive); }}
+.vf-verdict-badge.vf-neg-bg {{ background:rgba(239,68,68,0.18); color:var(--color-negative); }}
 .vf-hint {{ color:var(--muted); font-size:11px; margin-top:4px; font-family:'Fira Sans'; }}
 /* referencia de benchmark DENTRO de una KPI card: misma muestra discontinua
    ámbar que en gráficos y tarjetas de comparación, para leerla como "el mismo
@@ -204,7 +281,7 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
    alineada con la primera, la única tarjeta de la fila que se veía distinta
    al resto (comprobado). Con flex-start queda pegada arriba, igual la
    envuelva o no. */
-.vf-hint-bench {{ display:flex; align-items:flex-start; gap:7px; color:{BENCH};
+.vf-hint-bench {{ display:flex; align-items:flex-start; gap:7px; color:var(--bench);
   font-size:16.5px; font-family:'Fira Code',monospace; margin-top:9px;
   padding-top:9px; border-top:1px dashed var(--border); }}
 .vf-hint-bench .vf-dash-swatch {{ margin-top:8px; }}  /* centrada en la altura de línea del texto */
@@ -221,7 +298,7 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
 /* muestra discontinua ámbar: convención de "esto es el benchmark", reutilizada
    en los gráficos y en la referencia de benchmark de las KPI cards
    (§color-not-only: la diferencia entre series nunca depende sólo del color). */
-.vf-dash-swatch {{ display:inline-block; width:13px; height:0; border-top:2.5px dashed {BENCH};
+.vf-dash-swatch {{ display:inline-block; width:13px; height:0; border-top:2.5px dashed var(--bench);
   flex:0 0 auto; }}
 
 /* Alertas justo debajo del título (conflictos de NAV, chequeos de
@@ -251,19 +328,19 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
 
 /* --- guía de configuración (onboarding IBKR, pestaña Configuración) --- */
 .vf-guide-eyebrow {{ font-family:'Fira Code',monospace; font-size:12px; font-weight:600;
-  letter-spacing:.14em; text-transform:uppercase; color:{POS}; display:flex;
+  letter-spacing:.14em; text-transform:uppercase; color:var(--color-positive); display:flex;
   align-items:center; gap:9px; margin:4px 0 16px; }}
 .vf-guide-eyebrow::before {{ content:""; width:7px; height:7px; border-radius:2px;
-  background:{POS}; box-shadow:0 0 10px rgba(34,197,94,.6); flex:0 0 auto; }}
+  background:var(--color-positive); box-shadow:0 0 10px rgba(34,197,94,.6); flex:0 0 auto; }}
 .vf-step {{ margin-top:36px; padding-top:26px; border-top:1px solid var(--border); }}
 .vf-step:first-of-type {{ margin-top:8px; padding-top:0; border-top:none; }}
 .vf-step-head {{ display:flex; align-items:center; gap:12px; margin-bottom:4px; }}
 .vf-step-num {{ font-family:'Fira Code',monospace; font-size:12.5px; font-weight:600;
-  color:{POS}; background:rgba(34,197,94,.12); border:1px solid rgba(34,197,94,.35);
+  color:var(--color-positive); background:rgba(34,197,94,.12); border:1px solid rgba(34,197,94,.35);
   border-radius:6px; padding:3px 9px; flex:0 0 auto; }}
 .vf-step-head h3 {{ font-size:18px; font-weight:600; margin:0; display:flex;
   align-items:center; gap:9px; }}
-.vf-step-head .vf-ico {{ color:{POS}; }}
+.vf-step-head .vf-ico {{ color:var(--color-positive); }}
 .vf-step-note {{ color:var(--muted); font-size:14px; margin:8px 0 16px; text-align:justify; }}
 /* Párrafo de intro de la guía de alta ("Antes de sincronizar..."): mismo
    pedido de alineación justificada que los .vf-step-note de abajo, para
@@ -275,7 +352,7 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
 .vf-check-item {{ display:flex; align-items:flex-start; gap:8px; font-size:13px;
   background:var(--card); border:1px solid var(--border); border-radius:8px;
   padding:9px 11px; line-height:1.35; }}
-.vf-check-item svg {{ color:{POS}; flex:0 0 auto; margin-top:2px; }}
+.vf-check-item svg {{ color:var(--color-positive); flex:0 0 auto; margin-top:2px; }}
 .vf-check-item .tag {{ display:block; font-family:'Fira Code',monospace; font-size:10.5px;
   color:var(--muted); margin-top:2px; }}
 .vf-check-extra {{ color:var(--muted); font-size:12.5px; margin-top:10px; }}
@@ -284,9 +361,9 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
 .vf-callout svg {{ flex:0 0 auto; margin-top:2px; }}
 .vf-callout p {{ margin:0; }}
 .vf-callout-info {{ background:rgba(56,189,248,.08); border-color:rgba(56,189,248,.35); }}
-.vf-callout-info svg {{ color:{SERIES}; }}
+.vf-callout-info svg {{ color:var(--series); }}
 .vf-callout-warn {{ background:rgba(245,158,11,.08); border-color:rgba(245,158,11,.35); }}
-.vf-callout-warn svg {{ color:{BENCH}; }}
+.vf-callout-warn svg {{ color:var(--bench); }}
 .vf-kv-grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr));
   gap:8px; margin:10px 0 4px; }}
 .vf-kv-item {{ background:var(--card); border:1px solid var(--border); border-radius:8px;
@@ -294,17 +371,16 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
 .vf-kv-item .k {{ display:block; color:var(--muted); font-size:10.5px;
   text-transform:uppercase; letter-spacing:.04em; margin-bottom:3px; }}
 .vf-kv-item .v {{ font-family:'Fira Code',monospace; font-weight:600; }}
-.vf-kv-item .v.attn {{ color:{BENCH}; }}
+.vf-kv-item .v.attn {{ color:var(--bench); }}
 
-/* Oculta el menú "☰" (arriba a la derecha): ahí vive el selector de tema
-   de Streamlit (Settings → Theme), y el resto de la app da por hecho el
-   tema OLED — si alguien cambia a claro desde ese menú, todo lo que NO
-   está en las clases vf-* (sidebar nativo, inputs, tablas) se vuelve claro
-   y choca con las tarjetas/CSS a medida, que siguen fijas en oscuro. Más
-   fiable que confiar en que nadie toque el menú: quitarlo. Reforzado en
-   .streamlit/config.toml con [client] toolbarMode = "minimal" (ese sí
-   necesita reiniciar el proceso, como cualquier cambio de config.toml). */
-[data-testid="stMainMenu"], #MainMenu {{ visibility:hidden; }}
+/* El menú "☰" (Settings → "Choose app theme") ahora se deja VISIBLE a
+   propósito — antes se ocultaba porque la app solo sabía pintarse en
+   oscuro y cambiar de tema la rompía. Ya no: theme_watcher (ver su
+   declare_component más arriba) detecta claro/oscuro en vivo y
+   _apply_theme_palette() + [data-vf-theme="light"] (§:root) adaptan tanto
+   el CSS como lo que pinta Python (tablas, gráficos). Reforzado en
+   .streamlit/config.toml con [client] toolbarMode = "auto" (antes
+   "minimal", que escondía el menú entero). */
 
 /* La barra de arriba del todo: es la cabecera PROPIA de la app
    ([data-testid="stHeader"], 52px, position:absolute sobre el contenido),
@@ -2225,6 +2301,18 @@ def configuracion_view():
 # --------------------------------------------------------------------------
 
 def main():
+    # Invisible: detecta claro/oscuro (Settings -> "Choose app theme" de
+    # Streamlit) y aplica la paleta correspondiente ANTES de construir nada
+    # — tablas y gráficos deciden su color en Python, no lo puede arreglar
+    # el CSS después (ver _apply_theme_palette()). En el primerísimo
+    # render de la sesión el componente todavía no ha tenido ocasión de
+    # avisar (necesita un viaje de ida y vuelta) y se cae en "dark" — el
+    # mismo rerun automático que trae su primer valor ya corrige esto
+    # solo, igual que el resto de componentes de esta app.
+    _theme_result = _theme_watcher(key="theme_watcher")
+    _detected_theme = (_theme_result or {}).get("theme", "dark")
+    _apply_theme_palette(_detected_theme)
+
     # Título de página arriba del todo — SIEMPRE visible desde el primer
     # instante, antes de conectar o parsear nada: sin esto el cuerpo
     # principal queda en blanco durante la sincronización con IBKR (spinners

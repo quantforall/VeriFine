@@ -1,0 +1,101 @@
+<!--
+VeriFine — componente invisible que detecta qué tema (claro/oscuro) tiene
+activo Streamlit AHORA MISMO y se lo cuenta a los dos lados que lo
+necesitan, cada uno por una razón distinta:
+
+1. Al PADRE (window.parent.document, la página de verdad — este iframe
+   vive en uno aparte, como folder_picker): le pone un atributo
+   data-vf-theme="light"|"dark" en <html>. Todo nuestro CSS (THEME_CSS en
+   app.py) engancha de ahí sus variables --bg/--card/--fg/etc., así que
+   basta con esto para que TODA la hoja de estilos cambie de paleta sola.
+
+2. A PYTHON (setComponentValue): el mismo valor, porque hay una pieza que
+   el CSS no puede alcanzar de ningún modo — st.dataframe pinta las
+   celdas en un <canvas> con los colores que le da pandas.Styler, y esos
+   se deciden en el SERVIDOR antes de que el navegador sepa qué tema va a
+   mostrar. Sin este aviso, las tablas se quedarían con un solo tema fijo
+   pasara lo que pasara con el resto de la app.
+
+Streamlit no expone ningún gancho nativo para esto (ni un atributo
+data-theme, ni una variable CSS reutilizable — comprobado inspeccionando
+el DOM real cambiando de Light a Dark a mano): lo único que cambia de
+verdad es el color de fondo computado de <body>, así que ese es el único
+dato fiable del que tirar. Cambiar de tema NO recarga la página ni pasa
+por Python (confirmado: ninguna petición de red al elegirlo en
+Settings), así que hace falta un MutationObserver para enterarse de un
+cambio EN VIVO, no solo comprobarlo una vez al cargar.
+-->
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<style> html, body { margin:0; padding:0; } </style>
+</head>
+<body>
+<script>
+  function send(payload) {
+    window.parent.postMessage(Object.assign({isStreamlitMessage: true}, payload), "*");
+  }
+  function setValue(value) {
+    send({type: "streamlit:setComponentValue", value: value, dataType: "json"});
+  }
+  function setHeight() {
+    // Invisible a propósito: 0px, no hace falta hueco en la página.
+    send({type: "streamlit:setFrameHeight", height: 0});
+  }
+  function announce() {
+    send({type: "streamlit:componentReady", apiVersion: 1});
+    setHeight();
+  }
+
+  // Luminancia aproximada (percepción humana, no la media simple) del
+  // fondo computado de <body> en la página padre — por encima del umbral
+  // es un tema claro, por debajo uno oscuro. Con solo blanco/negro/grises
+  // de por medio (los temas de Streamlit) esto es más que suficiente,
+  // sin falsos positivos por color de acento.
+  function isLight(rgbString) {
+    const m = (rgbString || "").match(/\d+(\.\d+)?/g);
+    if (!m || m.length < 3) return false;
+    const [r, g, b] = m.map(Number);
+    return (0.299 * r + 0.587 * g + 0.114 * b) > 128;
+  }
+
+  let lastTheme = null;
+
+  function detectAndApply() {
+    let theme = "dark";
+    try {
+      const doc = window.parent.document;
+      const bg = doc.defaultView.getComputedStyle(doc.body).backgroundColor;
+      theme = isLight(bg) ? "light" : "dark";
+      doc.documentElement.setAttribute("data-vf-theme", theme);
+    } catch (e) {
+      // Cross-origin o el padre no está listo todavía — nos quedamos con
+      // "dark" (el de fábrica de la app) hasta el siguiente intento.
+    }
+    if (theme !== lastTheme) {
+      lastTheme = theme;
+      setValue({theme});
+    }
+  }
+
+  detectAndApply();
+  announce();
+
+  // MutationObserver sobre el <body> del padre: Streamlit repinta su
+  // fondo (y el resto) ahí mismo al cambiar de tema desde Settings, sin
+  // recargar la página — esto es lo que se entera EN VIVO.
+  try {
+    const parentBody = window.parent.document.body;
+    new MutationObserver(detectAndApply).observe(parentBody, {
+      attributes: true, attributeFilter: ["style", "class"]
+    });
+  } catch (e) { /* si el padre no está accesible aún, el poll de abajo cubre el hueco */ }
+
+  // Red de seguridad: por si el MutationObserver se pierde algún cambio
+  // (p. ej. Streamlit toca un elemento distinto de <body> en alguna
+  // versión futura) — barato de sobra para cada 2s.
+  setInterval(detectAndApply, 2000);
+</script>
+</body>
+</html>

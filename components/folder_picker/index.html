@@ -34,6 +34,19 @@ ahí.
     --series: #38BDF8; --series-dim: rgba(56,189,248,.08);
     --bench: #F59E0B; --bench-dim: rgba(245,158,11,.08);
   }
+  /* Este componente vive en su PROPIO iframe, con su PROPIO documento — no
+     hereda el data-vf-theme que theme_watcher pone en el <html> del padre
+     (ver su docstring en components/theme_watcher/index.html). Un script
+     al final de este fichero lo copia aquí mismo a mano (mismo origen,
+     mismo truco que ya usa este componente para hablar con el padre en
+     writeFiles()/wipeFolder()) — de ahí que este bloque cuelgue de un
+     data-theme PROPIO, no del mismo atributo. */
+  html[data-theme="light"] {
+    --bg: #FFFFFF; --border: #E2E8F0; --fg: #0F172A; --muted: #64748B;
+    --pos: #16A34A; --pos-dim: rgba(22,163,74,.10);
+    --series: #0284C7; --series-dim: rgba(2,132,199,.08);
+    --bench: #D97706; --bench-dim: rgba(217,119,6,.08);
+  }
   * { box-sizing: border-box; }
   body {
     margin: 0; padding: 2px 0; background: transparent; color: var(--fg);
@@ -360,9 +373,23 @@ ahí.
   // registrarse — sin esto, quedaba invisible hasta recargar la página
   // entera a mano. Ese mismo evento es también cómo llegan los ficheros
   // nuevos a escribir tras cada sincronización (fase "guardar al salir").
+  // Copia el tema del padre a este documento (ver el bloque
+  // html[data-theme="light"] de arriba) — mismo origen, mismo acceso
+  // directo que ya usa el resto del fichero. Si el padre aún no ha puesto
+  // nada (theme_watcher todavía no ha avisado) se queda en oscuro, el
+  // valor por defecto, hasta el siguiente "render".
+  function syncTheme() {
+    try {
+      const parentTheme = window.parent.document.documentElement.getAttribute("data-vf-theme");
+      document.documentElement.setAttribute("data-theme", parentTheme || "dark");
+    } catch (e) { /* no debería pasar, mismo origen — por si acaso */ }
+  }
+  syncTheme();
+
   window.addEventListener("message", (event) => {
     if (!(event.data && event.data.type === "streamlit:render")) return;
     announce();
+    syncTheme();
     const args = event.data.args || {};
     const files = args.files_to_write;
     if (files && files.length && folderHandle) writeFiles(files);
