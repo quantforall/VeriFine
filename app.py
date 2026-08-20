@@ -355,6 +355,29 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
   color: var(--muted) !important;
   -webkit-text-fill-color: var(--muted) !important;
 }}
+
+/* Autocompletado NATIVO del navegador (no es Streamlit ni Cloud): cuando
+   Chrome reconoce un valor ya escrito antes en un campo — reportado por
+   Juan con captura en "Query ID" —, pinta su propio fondo de sugerencia
+   por encima del nuestro. `background-color` no sirve para pisarlo:
+   Chrome ignora esa propiedad en un input autorellenado y solo respeta
+   unas pocas, entre ellas box-shadow — de ahí el truco clásico de un
+   inset gigante del tamaño del campo, en vez de un fondo normal.
+   La transición del color a 5000s es el mismo truco: Chrome anima SU
+   fondo con un fade propio que no se puede desactivar directamente;
+   alargar la transición a algo mayor que cualquier sesión real la deja
+   inmóvil en la práctica. */
+[data-testid="stTextInputRootElement"] input:-webkit-autofill,
+[data-testid="stDateInputField"]:-webkit-autofill,
+[data-testid="stNumberInputField"]:-webkit-autofill,
+[data-baseweb="input"] input:-webkit-autofill,
+[data-baseweb="base-input"] input:-webkit-autofill,
+[data-baseweb="select"] input:-webkit-autofill {{
+  -webkit-box-shadow: 0 0 0 1000px var(--card) inset !important;
+  -webkit-text-fill-color: var(--fg) !important;
+  caret-color: var(--fg) !important;
+  transition: background-color 5000s ease-in-out 0s;
+}}
 /* El valor que muestra un selectbox no es un <input>, es un div aparte.
    El multiselect queda FUERA a propósito: sus chips ya llevan texto
    oscuro sobre verde unas reglas más abajo, y un color general aquí se
@@ -854,10 +877,21 @@ def _run_incremental_sync(token: str, qid: str, state_path: str):
     try:
         client = FlexClient(token=token, query_id=qid, raw_dir=RAW_DIR)
         with st.status("Sincronizando desde el último día…", expanded=True) as status:
+            bar = st.progress(0.0)
             try:
-                status.write("Pidiendo el rango pendiente…")
+                # Antes esto era un único status.write() estático seguido de
+                # una llamada bloqueante entera — mientras IBKR genera el
+                # informe (asíncrono en su lado, puede ser la parte más
+                # larga) no había ninguna señal de que algo seguía en marcha.
+                # on_progress da 3 pasos fijos (ver daily_job() en q4_sync.py)
+                # en vez de dejarlo mudo.
+                def _tick(i, n, msg):
+                    bar.progress(i / n)
+                    status.write(f"({i}/{n}) {msg}")
+
                 res = daily_job(client, state_path, qid, _incremental_parse_fn,
-                                _incremental_recompute_fn)
+                                _incremental_recompute_fn, on_progress=_tick)
+                bar.progress(1.0)
                 if res["status"] == "ok":
                     status.update(label="Sincronización completa", state="complete")
                     wm = res.get("watermark", "")

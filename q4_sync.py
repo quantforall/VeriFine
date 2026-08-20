@@ -278,19 +278,35 @@ def check_golden(state: SyncState, state_path: str, recomputed: dict[str, float]
 # --------------------------------------------------------------------------
 
 def daily_job(client: FlexClient, state_path: str, query_id: str,
-              parse_fn, recompute_fn, notify_fn=None) -> dict:
+              parse_fn, recompute_fn, notify_fn=None, on_progress=None) -> dict:
     """Orquesta la sincronización diaria de una cuenta.
 
     parse_fn(raw_path)     -> (nav_por_fecha: dict, fechas: list[str])
     recompute_fn()         -> {"2023": 7.497979, ...} sobre TODO el histórico
     notify_fn(nivel, msg)  -> canal de aviso al usuario
+    on_progress(i, n, msg) -> igual que el `on_progress` de backfill() (ver más
+                              arriba), pero aquí con 3 pasos fijos en vez de un
+                              bloque por ventana: pedir a IBKR, parsear lo
+                              recibido, recalcular el histórico completo.
+                              Sin esto, la interfaz se queda con un único
+                              mensaje estático mientras dure la llamada — y la
+                              espera a IBKR (que genera el informe de forma
+                              asíncrona) puede ser la parte más larga de toda
+                              la sincronización, justo la que menos aviso
+                              tenía (pedido por Juan: "un contador para que el
+                              usuario vea que sigue haciendo cosas").
 
     El recálculo es SIEMPRE completo. Añadir sólo el día nuevo al final de la
     cadena no vale: una corrección dentro de la ventana de solape cambia un
     retorno pasado y arrastra todo lo posterior. Recalcular 945 días son
     milisegundos.
     """
+    def _tick(i, msg):
+        if on_progress:
+            on_progress(i, 3, msg)
+
     state = SyncState.load(state_path, query_id)
+    _tick(1, "Preguntando a IBKR por el último cierre disponible…")
     res = incremental(client, state, state_path)
 
     if notify_fn:
@@ -304,12 +320,14 @@ def daily_job(client: FlexClient, state_path: str, query_id: str,
         return res
 
     prev_watermark = state.watermark
+    _tick(2, "Descarga recibida — parseando el extracto…")
     nav, dates = parse_fn(res["raw_path"])
     if not dates or max(dates) <= prev_watermark:
         log.info("Sin fechas nuevas (fin de semana, festivo o cierre no generado)")
         return dict(status="no_new_data", watermark=state.watermark)
 
     update_watermark(state, state_path, dates)
+    _tick(3, "Recalculando el histórico completo…")
     drift = check_golden(state, state_path, recompute_fn())
     if drift and notify_fn:
         notify_fn("warning", "Los años cerrados han cambiado: " + " · ".join(drift))
