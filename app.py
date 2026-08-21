@@ -913,7 +913,7 @@ _CACHE_TTL_BENCH = "6h"
 @st.cache_data(show_spinner="Parseando extractos…",
                hash_funcs={tuple: _stable_cache_key},
                max_entries=_CACHE_MAX_DATASETS, ttl=_CACHE_TTL)
-def load_paths(paths: tuple[str, ...], _on_progress=None) -> P.Dataset:
+def load_paths(paths: tuple[str, ...]) -> P.Dataset:
     """Cachea por NOMBRE de fichero, no por ruta completa — `paths` trae el
     RAW_DIR de la sesión (un `tempfile.mkdtemp()` distinto cada vez, ver
     `q4_storage.init_session_storage`), así que con la ruta completa como
@@ -924,14 +924,17 @@ def load_paths(paths: tuple[str, ...], _on_progress=None) -> P.Dataset:
     es estable entre sesiones porque el XML crudo es inmutable por diseño
     (mismo argumento que `q4_parser.parse_file_cached`).
 
-    `_on_progress` — con el guión bajo a propósito: `st.cache_data` excluye
-    de la clave de caché cualquier parámetro que empiece por `_` (no lo
-    hashea, ni falla si no es hasheable — una función no lo es). Así se
-    puede pasar un callback de progreso sin invalidar ni fragmentar la
-    caché entre llamadas que sólo difieren en quién quiere feedback visual
-    ahora mismo (ver el uso en sidebar_source(), justo tras el backfill)."""
+    SIN `on_progress` a propósito — REGRESIÓN encontrada en producción
+    (CacheReplayClosureError): un callback que llama a comandos de
+    Streamlit (bar.progress()/poll_line.markdown()) desde DENTRO de una
+    función `@st.cache_data` revienta al reproducirse en un acierto de
+    caché futuro, porque el callback es un closure atado a los widgets de
+    la sesión que lo creó — no se puede "reproducir" en otra. El progreso
+    en vivo del parseo tras el backfill llama a `P.load()` SIN pasar por
+    aquí (ver sidebar_source) y esta función se llama después, ya sin
+    callback, sólo para dejar la caché de proceso poblada con normalidad."""
     with PR.timed("load_paths", n_files=len(paths)):
-        return P.load(list(paths), on_progress=_on_progress)
+        return P.load(list(paths))
 
 
 def _sync_up_parsed_cache(paths: tuple[str, ...]) -> None:
@@ -1862,18 +1865,31 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
                         st.session_state["paths"] = paths
 
                         # Progreso POR FICHERO, no un mensaje estático seguido
-                        # de un load_paths() bloqueante — con un histórico
-                        # grande recién descargado (nada en caché todavía,
-                        # ver q4_parser.parse_file_cached), parsear puede
-                        # tardar y antes no había ninguna señal de avance
-                        # hasta que TODO terminaba. Reutiliza bar/poll_line,
-                        # ya libres tras las fases de arriba (validar query +
-                        # descargar bloques).
+                        # de una llamada bloqueante — con un histórico grande
+                        # recién descargado (nada en caché todavía, ver
+                        # q4_parser.parse_file_cached), parsear puede tardar y
+                        # antes no había ninguna señal de avance hasta que
+                        # TODO terminaba. Reutiliza bar/poll_line, ya libres
+                        # tras las fases de arriba (validar query + descargar
+                        # bloques).
+                        #
+                        # P.load() DIRECTO (sin caché), no load_paths() — un
+                        # callback que llama a comandos de Streamlit desde
+                        # DENTRO de una función @st.cache_data revienta al
+                        # reproducirse en un futuro acierto de caché
+                        # (CacheReplayClosureError, visto en producción: closure
+                        # atado a los widgets de ESTA sesión, no reproducible en
+                        # otra). load_paths(paths) de después, ya SIN callback,
+                        # deja la caché de proceso poblada con normalidad —
+                        # el parseo en sí no se repite (parse_file_cached ya lo
+                        # dejó en disco arriba), así que esta segunda pasada es
+                        # sólo fundir/deduplicar, barato.
                         def _parse_tick(i, n, name):
                             bar.progress(i / n if n else 1.0)
                             poll_line.markdown(f"↻ Parseando {i}/{n}: {name}")
 
-                        load_paths(paths, _on_progress=_parse_tick)
+                        P.load(list(paths), on_progress=_parse_tick)
+                        load_paths(paths)
                         poll_line.empty()
                         bar.progress(1.0)
                         _sync_up_parsed_cache(paths)
