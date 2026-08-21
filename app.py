@@ -1699,19 +1699,24 @@ def drawdown_chart(s_total: E.Series, s_strat: E.Series, currency: str,
                   if bench else ""))
 
 
-def yearly_bar_chart(yt: pd.DataFrame, bench_col: str | None = None):
+def yearly_bar_chart(yt: pd.DataFrame, bench_col: str | None = None, use_total: bool = False):
     """Comparativa por año: barra horizontal ordenada por AÑO (más reciente
     arriba). Verde/rojo por signo, con el valor rotulado (+/−) para no depender
     del color. Si hay columna de benchmark, se marca como un TICK vertical
     ámbar sobre la barra de su mismo año — el patrón "bullet chart target":
-    un punto de referencia, no una segunda barra, para no duplicar la lectura."""
-    d = yt.dropna(subset=["Estrategia"]).copy()
+    un punto de referencia, no una segunda barra, para no duplicar la lectura.
+
+    `use_total` sólo decide el TEXTO (nombre de traza/eje/leyenda) — el valor
+    ya viene en la columna "Rentabilidad" de `yt`, calculado según la misma
+    magnitud por years_table()."""
+    label = "Total" if use_total else "Estrategia"
+    d = yt.dropna(subset=["Rentabilidad"]).copy()
     if d.empty:
         return
     # orden por año ascendente -> Plotly lo dibuja de abajo arriba, así que el
     # año más reciente queda arriba.
     d = d.sort_values(by="Año", key=lambda s: s.str[:4].astype(int))
-    colors = [POS if v >= 0 else NEG for v in d["Estrategia"]]
+    colors = [POS if v >= 0 else NEG for v in d["Rentabilidad"]]
 
     # El alto de cada barra debe ser SIEMPRE el mismo, filtres los años que
     # filtres. Plotly reparte el área de dibujo entera entre las categorías
@@ -1733,9 +1738,9 @@ def yearly_bar_chart(yt: pd.DataFrame, bench_col: str | None = None):
     bar_width = 1 - (1 - bar_width_prev) / 2
 
     fig = go.Figure(go.Bar(
-        y=d["Año"], x=d["Estrategia"], orientation="h", marker_color=colors,
-        name="Estrategia", width=bar_width,
-        text=[f"{v:+.1f} %" for v in d["Estrategia"]], textposition="outside",
+        y=d["Año"], x=d["Rentabilidad"], orientation="h", marker_color=colors,
+        name=label, width=bar_width,
+        text=[f"{v:+.1f} %" for v in d["Rentabilidad"]], textposition="outside",
         textfont=dict(family="Fira Code, monospace", color=FG),
         # sin "+" en el spec: con él, Plotly (comprobado en 3.1.0) deja de
         # redondear y muestra el float con toda su precisión — el signo ya se
@@ -1752,7 +1757,8 @@ def yearly_bar_chart(yt: pd.DataFrame, bench_col: str | None = None):
             hovertemplate=f"{bench_col}: " + "%{x:.2f} %<extra></extra>"))
 
     _style_fig(fig, height=CHROME_PX + BAR_PX * len(d) + (40 if has_bench else 0), ytitle=None)
-    fig.update_layout(showlegend=has_bench, xaxis_title="Rentabilidad de la estrategia (%)")
+    fig.update_layout(showlegend=has_bench,
+                      xaxis_title=f"Rentabilidad {'total' if use_total else 'de la estrategia'} (%)")
     if has_bench:
         fig.update_layout(
             margin=dict(t=46),
@@ -1761,7 +1767,7 @@ def yearly_bar_chart(yt: pd.DataFrame, bench_col: str | None = None):
     # margen a ambos lados: deja sitio a las etiquetas fuera de barra (sobre todo
     # la de una barra negativa) para que no pisen las etiquetas del eje. Si hay
     # marcador de benchmark, entra también en el rango para que no quede cortado.
-    vals = [d["Estrategia"].min(), d["Estrategia"].max(), 0.0]
+    vals = [d["Rentabilidad"].min(), d["Rentabilidad"].max(), 0.0]
     if has_bench:
         vals += [db[bench_col].min(), db[bench_col].max()]
     xmin, xmax = min(vals), max(vals)
@@ -1770,7 +1776,7 @@ def yearly_bar_chart(yt: pd.DataFrame, bench_col: str | None = None):
     st.plotly_chart(fig, use_container_width=True)
     if has_bench:
         st.caption(f"El tick ámbar es {bench_col} ese mismo año, como referencia sobre la barra "
-                   "de la Estrategia — no es una segunda barra, para no duplicar la lectura.")
+                   f"de {label} — no es una segunda barra, para no duplicar la lectura.")
 
 
 def analyzable_dates(ds: P.Dataset, accounts: list[str] | None) -> list[str]:
@@ -1807,7 +1813,13 @@ def _bench_window_return(bo: dict | None, dates: list[str], a: str, b: str) -> f
 
 
 def years_table(ds: P.Dataset, currency: str, rf: float, dates: list[str],
-                accounts: list[str] | None = None, bo: dict | None = None) -> pd.DataFrame:
+                accounts: list[str] | None = None, bo: dict | None = None,
+                use_total: bool = False) -> pd.DataFrame:
+    """`use_total` gobierna qué magnitud se calcula por año — Total (con
+    efecto divisa) o Estrategia (FX-neutral, por defecto) — compartido con
+    trailing_table()/benchmark_section() vía el mismo botón en _metricas_tab
+    (a petición expresa: los tres bloques deben leerse en la misma magnitud
+    a la vez, no cada uno por su lado)."""
     rows = []
     for y in sorted({d[:4] for d in dates}):
         prior = [d for d in dates if d < y + "0101"]
@@ -1820,13 +1832,12 @@ def years_table(ds: P.Dataset, currency: str, rf: float, dates: list[str],
             att = _attr(a, b, currency, accounts)
         except Exception:
             continue
-        m = M.from_series(att.series_strategy, rf=rf)
+        series = att.series_total if use_total else att.series_strategy
+        m = M.from_series(series, rf=rf)
         partial = not m.annualizable
         rows.append({
             "Año": y + (" YTD" if partial else ""),
-            f"Total {currency}": att.total * 100,
-            "Estrategia": att.strategy * 100,
-            "Divisa": att.fx * 100,
+            "Rentabilidad": (att.total if use_total else att.strategy) * 100,
             "Vol": m.vol, "Sharpe": m.sharpe, "Máx. DD": m.max_dd,
             f"{bo['name']}" if bo else "Benchmark": _bench_window_return(bo, dates, a, b),
         })
@@ -1834,22 +1845,27 @@ def years_table(ds: P.Dataset, currency: str, rf: float, dates: list[str],
 
 
 def trailing_table(ds: P.Dataset, currency: str, rf: float, dates: list[str],
-                   accounts: list[str] | None = None, bo: dict | None = None) -> pd.DataFrame:
+                   accounts: list[str] | None = None, bo: dict | None = None,
+                   use_total: bool = False) -> pd.DataFrame:
+    """Mismo `use_total` que years_table() — ver su docstring. Antes esta
+    tabla mostraba SIEMPRE "Acum. total" y "Acum. estrategia" a la vez, pero
+    Vol/Máx. DD/Anualizado sólo se calculaban de la Estrategia — a petición
+    expresa, ahora TODO (incluido el acumulado) sale de la magnitud elegida,
+    una sola columna, consistente con los otros dos bloques."""
     bench_col = bo["name"] if bo else "Benchmark"
     rows = []
     for w in M.trailing_windows(dates):
         if not w["available"]:
-            rows.append({"Ventana": w["label"], "Acum. total": None,
-                         "Acum. estrategia": None, "Anual. estrategia": None,
+            rows.append({"Ventana": w["label"], "Acumulado": None, "Anualizado": None,
                          "Vol": None, "Máx. DD": None, bench_col: None,
                          "Nota": f"Sin datos · requiere histórico desde {w['needs']}"})
             continue
         att = _attr(w["start"], w["end"], currency, accounts)
-        m = M.from_series(att.series_strategy, rf=rf)
-        rows.append({"Ventana": w["label"], "Acum. total": att.total * 100,
-                     "Acum. estrategia": att.strategy * 100,
-                     "Anual. estrategia": m.cagr, "Vol": m.vol,
-                     "Máx. DD": m.max_dd,
+        series = att.series_total if use_total else att.series_strategy
+        m = M.from_series(series, rf=rf)
+        rows.append({"Ventana": w["label"],
+                     "Acumulado": (att.total if use_total else att.strategy) * 100,
+                     "Anualizado": m.cagr, "Vol": m.vol, "Máx. DD": m.max_dd,
                      bench_col: _bench_window_return(bo, dates, w["start"], w["end"]),
                      "Nota": ""})
     return pd.DataFrame(rows)
@@ -1953,16 +1969,27 @@ def efecto_divisa_view(ds: P.Dataset, accounts: list[str] | None, currency: str,
                "resultado mucho más de lo que añade riesgo.")
 
 
-def benchmark_section(strat_series: E.Series, rf: float, tickers: list[str]):
-    """§15 — compara la Estrategia (FX-neutral) contra cada benchmark elegido en
-    la barra lateral, en su divisa local (USD), §15.2. La beta va siempre junto
-    al alfa (§15.5). Incluye volatilidad y máx. drawdown DEL benchmark en
-    solitario (no relativos), para leer el riesgo sin tener que calcularlo."""
+def benchmark_section(strat_series: E.Series, rf: float, tickers: list[str],
+                      use_total: bool = False):
+    """§15 — compara la magnitud elegida (Total o Estrategia FX-neutral,
+    mismo botón que years_table()/trailing_table() en _metricas_tab) contra
+    cada benchmark elegido en la barra lateral, en su divisa local (USD). La
+    beta va siempre junto al alfa (§15.5). Incluye volatilidad y máx.
+    drawdown DEL benchmark en solitario (no relativos), para leer el riesgo
+    sin tener que calcularlo.
+
+    §15.2 original: comparar Total (con efecto divisa) contra un benchmark
+    en divisa distinta mezcla el resultado con el tipo de cambio, no es
+    "sistema contra sistema" — a petición expresa, se ofrece igualmente como
+    opción (con la etiqueta y el pie de página dejando claro qué se está
+    mirando en cada caso), no se fuerza siempre a Estrategia."""
     section_header("target", "Comparación con benchmark — detalle")
     if not tickers:
         st.caption("Elige un benchmark en la barra lateral para ver el detalle.")
         return
 
+    label = "Total" if use_total else "Estrategia"
+    acum_col = f"Acum. {label.lower()}"
     dates = strat_series.dates
     r_strat = pd.Series(strat_series.returns, index=dates[1:])
     rows, flags = [], []
@@ -1977,7 +2004,7 @@ def benchmark_section(strat_series: E.Series, rf: float, tickers: list[str]):
             continue
         rows.append({
             "Benchmark": B.BENCHMARKS.get(tk, {}).get("name", tk),
-            "Acum. estrategia": m["cum_portfolio"], "Acum. bench": m["cum_benchmark"],
+            acum_col: m["cum_portfolio"], "Acum. bench": m["cum_benchmark"],
             "Vol. bench": bm.vol, "Máx. DD bench": bm.max_dd,
             "Alfa": m["alpha"], "Beta": m["beta"],
             "Captura +": m["up_capture"], "Captura −": m["down_capture"],
@@ -1990,11 +2017,12 @@ def benchmark_section(strat_series: E.Series, rf: float, tickers: list[str]):
         return
     # Cabeceras cortas + `help`: con los nombres largos la tabla se iba de
     # ancho y las últimas métricas (captura, tracking error) quedaban fuera.
-    st.dataframe(style(pd.DataFrame(rows), ["Acum. estrategia", "Acum. bench", "Alfa"]),
+    st.dataframe(style(pd.DataFrame(rows), [acum_col, "Acum. bench", "Alfa"]),
                  width='stretch', hide_index=True,
                  column_config={
-                     "Acum. estrategia": st.column_config.Column(
-                         label="Acum. estr.", help="Acumulado de la Estrategia (FX-neutral)"),
+                     acum_col: st.column_config.Column(
+                         label="Acum. total" if use_total else "Acum. estr.",
+                         help=f"Acumulado de {'Total (con efecto divisa)' if use_total else 'la Estrategia (FX-neutral)'}"),
                      "Acum. bench": st.column_config.Column(
                          label="Acum. bmk", help="Acumulado del benchmark"),
                      "Vol. bench": st.column_config.Column(
@@ -2007,11 +2035,18 @@ def benchmark_section(strat_series: E.Series, rf: float, tickers: list[str]):
                      "Info ratio": st.column_config.Column(
                          label="IR", help="Information ratio"),
                  })
-    st.caption(
-        f"Estrategia (FX-neutral) frente al benchmark en su divisa local (USD), §15.2 — "
-        f"sistema contra sistema, sin efecto divisa. Volatilidad y máx. drawdown son del "
-        f"benchmark en solitario; alfa y ratios con rf = {rf*100:.2f} %; "
-        "la beta va al lado del alfa (§15.5).")
+    if use_total:
+        st.caption(
+            f"Total (con efecto divisa incluido) frente al benchmark en su divisa local (USD) "
+            f"— aquí SÍ entra el tipo de cambio en la comparación (a diferencia de la lectura "
+            f"Estrategia, §15.2). Volatilidad y máx. drawdown son del benchmark en solitario; "
+            f"alfa y ratios con rf = {rf*100:.2f} %; la beta va al lado del alfa (§15.5).")
+    else:
+        st.caption(
+            f"Estrategia (FX-neutral) frente al benchmark en su divisa local (USD), §15.2 — "
+            f"sistema contra sistema, sin efecto divisa. Volatilidad y máx. drawdown son del "
+            f"benchmark en solitario; alfa y ratios con rf = {rf*100:.2f} %; "
+            "la beta va al lado del alfa (§15.5).")
     if flags:
         st.caption("Volatilidad/tracking no fiables (calendarios distintos, §15.3): "
                    + " · ".join(flags) + ". Se recomienda intersección de calendarios.")
@@ -2875,28 +2910,43 @@ def main():
         st.stop()
     d0, d1 = dates[0], dates[-1]
 
-    tab_metricas, tab_cartera, tab_divisa, tab_operaciones, tab_informe, tab_config = st.tabs(
-        ["MÉTRICAS", "CARTERA", "EFECTO DIVISA", "OPERACIONES", "INFORME", "CONFIGURACIÓN"])
+    # st.segmented_control, no st.tabs() — a propósito, y es la única razón
+    # de que esto ya no sean "pestañas" nativas: st.tabs() NO es perezoso,
+    # el cuerpo de las 6 se ejecuta ENTERO en cada rerun aunque solo se vea
+    # una (Streamlit ya renderiza las 6 de antemano y las oculta con CSS en
+    # el navegador) — cambiar cuentas o el periodo de análisis recalculaba
+    # T.portfolio()/T.build()/las tablas de Métricas/Informe TODAS a la vez,
+    # aunque el usuario solo estuviera mirando una (pedido por Juan: "sigue
+    # siendo poco fluido" tras cachear cada pieza por separado — el
+    # problema ya no era el coste de cada una, era pagarlas todas siempre).
+    #
+    # Con `key=`, la sección elegida vive en session_state y sobrevive a
+    # reruns disparados por OTROS widgets (cuentas, periodo) — no vuelve a
+    # "MÉTRICAS" solo porque cambiaste algo en el lateral.
+    #
+    # Contrapartida asumida a propósito: cambiar de sección ahora sí
+    # dispara un rerun del servidor (antes era 100% en el navegador, porque
+    # las 6 ya estaban calculadas). Se paga una vez por clic de sección, a
+    # cambio de dejar de pagarlo 6 veces por cada cambio de cuentas/periodo.
+    seccion = st.segmented_control(
+        "Sección", ["MÉTRICAS", "CARTERA", "EFECTO DIVISA", "OPERACIONES",
+                   "INFORME", "CONFIGURACIÓN"],
+        default="MÉTRICAS", key="main_section", label_visibility="collapsed") or "MÉTRICAS"
 
-    with tab_cartera:
+    if seccion == "CARTERA":
         portfolio_view(ds, accounts or None)
-
-    with tab_divisa:
+    elif seccion == "EFECTO DIVISA":
         if _tab_gate(license_mode):
             efecto_divisa_view(ds, accounts or None, currency, d0, d1)
-
-    with tab_operaciones:
+    elif seccion == "OPERACIONES":
         if _tab_gate(license_mode):
             operations_view(ds, accounts or None, d0, d1)
-
-    with tab_informe:
+    elif seccion == "INFORME":
         if _tab_gate(license_mode):
             informe_view(ds, accounts or None, currency, rf, d0, d1, bench_primary)
-
-    with tab_metricas:
+    elif seccion == "MÉTRICAS":
         _metricas_tab(ds, currency, rf, accounts, dates, d0, d1, bench_primary, bench_tickers)
-
-    with tab_config:
+    elif seccion == "CONFIGURACIÓN":
         configuracion_view()
 
 
@@ -2999,20 +3049,36 @@ def _metricas_tab(ds, currency, rf, accounts, dates, d0, d1, bench_primary, benc
         st.caption(f"No se pudo descargar {B.BENCHMARKS[bench_primary]['name']} de Yahoo "
                    "Finance; el panel sigue sin la comparativa de benchmark.")
 
-    section_header("bar-chart", "Rentabilidad de la estrategia por año")
-    yt = years_table(ds, currency, rf, dates, accounts or None, bo=bo)
-    yearly_bar_chart(yt, bench_col=bench_col)     # sólo años, sin el total
+    # Un solo botón para los tres bloques de abajo (año, ventanas móviles y
+    # benchmark) — a petición expresa: antes cada uno mostraba una magnitud
+    # fija (años/benchmark siempre Estrategia; ventanas mezclaba las dos sin
+    # opción), y no había forma de leerlos los tres en la misma magnitud a
+    # la vez. Mismo componente/formato que "Curva de capital"/"Drawdown" de
+    # arriba. `key=` para que sobreviva a reruns de otros widgets (cuentas,
+    # periodo) sin volver a "Estrategia" solo por eso.
+    st.caption("Aplica a los tres bloques de abajo — año, ventanas móviles y "
+              "benchmark: **Total** incluye el efecto divisa; **Estrategia** "
+              "lo neutraliza (FX-neutral, §7.1).")
+    magnitud = st.segmented_control("Magnitud", ["Total", "Estrategia"],
+                                    default="Estrategia", key="metricas_magnitud",
+                                    label_visibility="collapsed") or "Estrategia"
+    use_total = magnitud == "Total"
+
+    section_header("bar-chart", "Rentabilidad por año")
+    yt = years_table(ds, currency, rf, dates, accounts or None, bo=bo, use_total=use_total)
+    yearly_bar_chart(yt, bench_col=bench_col, use_total=use_total)
 
     section_header("layers", "Ventanas móviles")
-    tt = trailing_table(ds, currency, rf, dates, accounts or None, bo=bo)
-    st.dataframe(style(tt, ["Acum. total", "Acum. estrategia", "Anual. estrategia", bench_col]),
+    tt = trailing_table(ds, currency, rf, dates, accounts or None, bo=bo, use_total=use_total)
+    st.dataframe(style(tt, ["Acumulado", "Anualizado", bench_col]),
                  width='stretch', hide_index=True,
                  # el nombre del benchmark ("S&P 500 Total Return") como cabecera
                  # ensanchaba la columna por el título y empujaba "Nota" fuera.
                  column_config={bench_col: st.column_config.Column(
                      label="Benchmark", help=bench_col)})
 
-    benchmark_section(att.series_strategy, rf, bench_tickers)
+    benchmark_section(att.series_total if use_total else att.series_strategy,
+                      rf, bench_tickers, use_total=use_total)
 
 
 # Streamlit ejecuta el script con __name__ == "__main__", así que este guard
