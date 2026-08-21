@@ -93,8 +93,13 @@ class FakeDriveSession:
         return FakeResp(200, {"files": out})
 
     def _create_from_json(self, meta: dict) -> FakeResp:
+        # `parents` real (no [] fijo): hasta ahora sólo creaba la carpeta
+        # raíz "VeriFine" (sin parents, en la raíz del Drive), así que nunca
+        # hizo falta — subfolder() (q4_drive.py) SÍ crea con
+        # parents=[folder_id] y necesita que se respete para poder
+        # encontrarla después.
         fid = self._new_id()
-        self._files[fid] = dict(name=meta.get("name", ""), parents=[],
+        self._files[fid] = dict(name=meta.get("name", ""), parents=meta.get("parents", []),
                                 content=b"", trashed=False, modifiedTime=self._now())
         return FakeResp(200, {"id": fid})
 
@@ -287,6 +292,52 @@ def test_resolve_or_create_recreates_when_pointed_folder_deleted():
     tokens = D.DriveTokens(access_token="AT", refresh_token="RT", expiry="2099-01-01T00:00:00+00:00")
     second = D.DriveFolder.resolve_or_create(tokens, session=session)
     assert second.folder_id != first.folder_id
+
+
+# --------------------------------------------------------------------------
+# Subcarpetas (VeriFine/XML, VeriFine/JSON)
+# --------------------------------------------------------------------------
+
+def test_subfolder_creates_child_under_parent():
+    session = FakeDriveSession()
+    root = make_folder(session)
+    xml = root.subfolder("XML")
+    assert xml.folder_id != root.folder_id
+    assert session._files[xml.folder_id]["parents"] == [root.folder_id]
+    assert session._files[xml.folder_id]["name"] == "XML"
+
+
+def test_subfolder_is_idempotent_no_duplicate():
+    session = FakeDriveSession()
+    root = make_folder(session)
+    a = root.subfolder("XML")
+    b = root.subfolder("XML")
+    assert a.folder_id == b.folder_id
+    children = [f for f in session._files.values()
+               if f["parents"] == [root.folder_id] and f["name"] == "XML"]
+    assert len(children) == 1
+
+
+def test_subfolder_content_isolated_from_parent_and_siblings():
+    session = FakeDriveSession()
+    root = make_folder(session)
+    xml = root.subfolder("XML")
+    js = root.subfolder("JSON")
+    xml.upload("a.xml", b"<xml/>")
+    js.upload("a.xml.parsed.json", b"{}")
+    assert set(xml.list_files()) == {"a.xml"}
+    assert set(js.list_files()) == {"a.xml.parsed.json"}
+    # la raíz sólo ve las DOS subcarpetas como entradas — su contenido no
+    # se filtra hacia arriba (list_files() no es recursivo, ver docstring)
+    assert set(root.list_files()) == {"XML", "JSON"}
+
+
+def test_subfolder_different_names_get_different_folders():
+    session = FakeDriveSession()
+    root = make_folder(session)
+    xml = root.subfolder("XML")
+    js = root.subfolder("JSON")
+    assert xml.folder_id != js.folder_id
 
 
 # --------------------------------------------------------------------------

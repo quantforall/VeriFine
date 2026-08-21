@@ -69,6 +69,22 @@ Tema oscuro en `.streamlit/config.toml`.
 Sin esto configurado, el panel se detiene con un aviso claro en vez de
 fallar — no bloquea el resto del desarrollo (tests, `q4_daily.py`, etc.).
 
+Dentro de la carpeta "VeriFine" del Drive del usuario:
+
+```
+VeriFine/
+├── XML/                    extractos crudos de IBKR (inmutables, §18.7)
+├── JSON/                   parseo cacheado de cada crudo (q4_parser.parse_file_cached)
+├── license.json
+├── state_<queryId>.json
+└── ibkr_credentials.json
+```
+
+`q4_storage.py` decide qué va en cada subcarpeta por el sufijo del nombre
+(`.xml` / `.parsed.json`), y migra automáticamente cualquier fichero que
+haya quedado suelto en la raíz de instalaciones anteriores a esta
+organización — no hace falta ninguna acción manual.
+
 ## Job diario
 
 `q4_daily.py` sincroniza con IBKR, recalcula y corre el canario de regresión.

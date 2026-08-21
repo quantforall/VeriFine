@@ -87,12 +87,48 @@ class Series:
         return mdd
 
 
+@dataclass
+class SeriesInputs:
+    """Piezas de `build_series()` que dependen SOLO de `(dataset, cuentas)`
+    — nunca de `start`/`end` ni de la divisa de análisis (la conversión de
+    divisa pasa DESPUÉS, dentro de `build_series()`, vía `fx.rate(m, d)`).
+
+    Calcularlas una vez y reutilizarlas entre llamadas es lo que evita
+    recorrer el histórico ENTERO una vez por año/ventana en
+    `years_table()`/`trailing_table()` (app.py) — ver `precompute_series_inputs()`."""
+    fx_matrix: dict[str, dict[str, float]]
+    navs: dict[str, float]
+    buckets: dict[str, dict[str, float]]
+    accr: dict[str, float]
+    flows: dict[str, list[tuple[str, float]]]
+
+
+def precompute_series_inputs(ds: Dataset, accounts: list[str] | None = None) -> SeriesInputs:
+    """Calcula de una vez las cinco piezas de `build_series()`/`attribute()`
+    que no dependen del periodo pedido.
+
+    `attribute()` llama a `build_series()` dos veces (real y "congelada",
+    §7.1) — sin esto, cada una recalculaba las cinco por su cuenta, aunque
+    fueran idénticas salvo `buckets` (que sólo hace falta en la congelada).
+    `years_table()`/`trailing_table()` (app.py) llaman a `attribute()` una
+    vez por año/ventana con el MISMO dataset y cuentas — pasar aquí el
+    resultado de una sola llamada evita repetirlo una vez por cada una."""
+    return SeriesInputs(
+        fx_matrix=fx_matrix(ds),
+        navs=nav_series(ds, accounts),
+        buckets=currency_buckets(ds, accounts),
+        accr=accruals(ds, accounts),
+        flows=flows(ds, accounts),
+    )
+
+
 def build_series(ds: Dataset, start: str, end: str,
                  analysis_currency: str | None = None,
                  accounts: list[str] | None = None,
                  fx_frozen_at: str | None = None,
                  from_buckets: bool = False,
-                 w: float = W_FLOW) -> Series:
+                 w: float = W_FLOW,
+                 precomputed: SeriesInputs | None = None) -> Series:
     """Construye la serie de retornos diarios.
 
     from_buckets=False -> valor = NAV oficial de IBKR, convertido a la moneda
@@ -100,15 +136,22 @@ def build_series(ds: Dataset, start: str, end: str,
     from_buckets=True  -> valor = suma de los cubos por divisa revalorados con
                           la matriz fx dada. Con fx_frozen_at, es la
                           Estrategia (§7.1).
+
+    `precomputed`: resultado de `precompute_series_inputs(ds, accounts)` ya
+    calculado por quien llama (típicamente `attribute()`, o app.py entre
+    varias llamadas) — si no se da, se calcula aquí igual que siempre. Sólo
+    es un atajo para no repetir trabajo; el resultado es idéntico en ambos
+    casos porque son las mismas cinco funciones sobre el mismo `(ds, accounts)`.
     """
     base = ds.base_currency
     m = analysis_currency or base
-    fx = FX(fx_matrix(ds), base, frozen_at=fx_frozen_at)
+    inputs = precomputed or precompute_series_inputs(ds, accounts)
+    fx = FX(inputs.fx_matrix, base, frozen_at=fx_frozen_at)
 
-    navs = nav_series(ds, accounts)
-    buckets = currency_buckets(ds, accounts) if from_buckets else None
-    accr = accruals(ds, accounts)
-    fl = flows(ds, accounts)
+    navs = inputs.navs
+    buckets = inputs.buckets if from_buckets else None
+    accr = inputs.accr
+    fl = inputs.flows
 
     dates = [d for d in sorted(navs) if start <= d <= end]
     if len(dates) < 2:
@@ -158,17 +201,26 @@ class Attribution:
 
 def attribute(ds: Dataset, start: str, end: str,
               analysis_currency: str | None = None,
-              accounts: list[str] | None = None) -> Attribution:
+              accounts: list[str] | None = None,
+              precomputed: SeriesInputs | None = None) -> Attribution:
     """§7 — Estrategia por simulación FX-neutral, divisa por RESIDUO.
 
     Definir la divisa como residuo garantiza por construcción que el desglose
     cierre. Calcular ambos componentes por separado dejaría un término cruzado
     sin atribuir y T5 fallaría por unos puntos básicos sin que eso indicara
     ningún error real.
+
+    Las dos llamadas a `build_series()` de abajo (real y congelada) comparten
+    el mismo `(ds, accounts)` — por eso `precompute_series_inputs()` se
+    calcula UNA vez aquí (o se reutiliza el de `precomputed`, si quien llama
+    ya lo tenía de una llamada anterior con el mismo dataset/cuentas — ver
+    `app.py::_cached_series_inputs`) y se pasa a ambas, en vez de que cada
+    una repita el mismo trabajo por su cuenta.
     """
-    st = build_series(ds, start, end, analysis_currency, accounts)
+    inputs = precomputed or precompute_series_inputs(ds, accounts)
+    st = build_series(ds, start, end, analysis_currency, accounts, precomputed=inputs)
     sn = build_series(ds, start, end, analysis_currency, accounts,
-                      fx_frozen_at=start, from_buckets=True)
+                      fx_frozen_at=start, from_buckets=True, precomputed=inputs)
     total, strat = st.total(), sn.total()
     return Attribution(total=total, strategy=strat,
                        fx=(1 + total) / (1 + strat) - 1,

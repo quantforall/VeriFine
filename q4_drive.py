@@ -263,6 +263,35 @@ class DriveFolder:
                           json={"name": FOLDER_NAME, "mimeType": FOLDER_MIME})
         return r.json()["id"]
 
+    def subfolder(self, name: str) -> "DriveFolder":
+        """Localiza o crea una subcarpeta `name` DENTRO de esta carpeta —
+        para VeriFine/XML y VeriFine/JSON (ver q4_storage.py, que decide qué
+        va en cada una). Devuelve un `DriveFolder` nuevo apuntando a ella;
+        list_files/upload/download/delete no cambian, sólo dependen de
+        `folder_id` — así que funcionan igual sin más código.
+
+        Se resuelve de nuevo en cada llamada (no se cachea el id en
+        memoria), igual que `resolve_or_create()` — consistente con que
+        nada aquí memoriza resultados de la API entre llamadas."""
+        found = self._find_child_folder(name)
+        folder_id = found["id"] if found else self._create_child_folder(name)
+        return DriveFolder(tokens=self.tokens, folder_id=folder_id, session=self.session)
+
+    def _find_child_folder(self, name: str) -> dict | None:
+        r = self._request("GET", f"{DRIVE_API}/files", params={
+            "q": (f"'{self.folder_id}' in parents and trashed=false and "
+                 f"mimeType='{FOLDER_MIME}' and name='{name}'"),
+            "fields": "files(id)",
+        })
+        files = r.json().get("files", [])
+        return files[0] if files else None
+
+    def _create_child_folder(self, name: str) -> str:
+        r = self._request("POST", f"{DRIVE_API}/files",
+                          json={"name": name, "mimeType": FOLDER_MIME,
+                                "parents": [self.folder_id]})
+        return r.json()["id"]
+
     def _find_in_appdata(self, name: str) -> dict | None:
         r = self._request("GET", f"{DRIVE_API}/files", params={
             "spaces": "appDataFolder",

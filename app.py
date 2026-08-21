@@ -788,6 +788,18 @@ def _stable_cache_key(paths: tuple) -> str:
     return "\x00".join(os.path.basename(p) for p in paths)
 
 
+class _RawPaths(tuple):
+    """Envoltorio de sólo TIPO sobre una tupla de rutas de crudos.
+
+    `hash_funcs` registra por tipo, no por nombre de parámetro — funciones
+    como `_cached_attribute()` reciben `paths` Y OTRA tupla (`accounts`) a la
+    vez, así que registrar el override sobre `tuple` a secas lo aplicaría
+    también a `accounts` (inofensivo hoy — `os.path.basename()` es un no-op
+    sobre un ID de cuenta sin "/", pero es un accidente del que depender, no
+    una garantía). Con este tipo propio, sólo `paths` califica."""
+    pass
+
+
 @st.cache_data(show_spinner="Parseando extractos…",
                hash_funcs={tuple: _stable_cache_key})
 def load_paths(paths: tuple[str, ...]) -> P.Dataset:
@@ -812,22 +824,42 @@ def _sync_up_parsed_cache(paths: tuple[str, ...]) -> None:
     Sólo sube los que Drive NO tenga ya (una llamada a `list_files()` para
     saberlo, no N) — llamar a esto pasa en CADA carga, incluida la de "ya
     había datos, sólo mostrarlos" (líneas de abajo); sin ese filtro se
-    resubiría sin cambios el mismo fichero en cada sesión, para siempre."""
+    resubiría sin cambios el mismo fichero en cada sesión, para siempre.
+
+    `.parsed.json` vive en la subcarpeta JSON/ de Drive (ver q4_storage.py:
+    `_target_subdir`), no en la raíz — de ahí `drive.subfolder("JSON")` en
+    vez de `drive` a secas para saber qué hay ya."""
     if not paths:
         return
     drive = st.session_state.get("_drive_folder")
     if drive is None:
         return
     raw_dir = os.path.dirname(paths[0])
-    known = drive.list_files()
+    known = drive.subfolder(ST.JSON_SUBDIR).list_files()
     names = [n for n in (os.path.basename(p) + ".parsed.json" for p in paths)
              if n not in known]
     if names:
         ST.sync_up(drive, raw_dir, *names)
 
 
-@st.cache_data(show_spinner=False)
-def _cached_attribute(paths: tuple[str, ...], start: str, end: str,
+@st.cache_data(show_spinner=False, hash_funcs={_RawPaths: _stable_cache_key})
+def _cached_series_inputs(paths: _RawPaths, accounts: tuple[str, ...] | None) -> E.SeriesInputs:
+    """Envoltorio cacheado de E.precompute_series_inputs() — ver su docstring
+    y la de E.SeriesInputs. Clave en `(paths, accounts)` SIN start/end/divisa
+    a propósito: estas piezas no dependen de ninguno de los dos (la
+    conversión de divisa pasa después, dentro de build_series()).
+
+    Esto es lo que hace que years_table() (una llamada a _attr() por año) y
+    trailing_table() (una por ventana móvil) dejen de recalcular fx_matrix/
+    nav_series/currency_buckets/accruals/flows sobre TODO el histórico una
+    vez por cada año/ventana — con esto se calculan UNA VEZ por (histórico,
+    cuentas) mostrado y se reutilizan mientras sólo cambie el periodo."""
+    ds = load_paths(paths)
+    return E.precompute_series_inputs(ds, list(accounts) if accounts else None)
+
+
+@st.cache_data(show_spinner=False, hash_funcs={_RawPaths: _stable_cache_key})
+def _cached_attribute(paths: _RawPaths, start: str, end: str,
                       currency: str | None, accounts: tuple[str, ...] | None) -> E.Attribution:
     """Envoltorio cacheado de E.attribute() — la llamada más repetida y más
     cara del motor: aparece en las 5 pestañas de resultados (una vez suelta
@@ -841,10 +873,19 @@ def _cached_attribute(paths: tuple[str, ...], start: str, end: str,
     en vez del propio Dataset — un objeto Python arbitrario grande sería
     lento de hashear en cada llamada, aparte de frágil. `accounts` como
     tupla por lo mismo: las listas ya casan con el hasher de Streamlit,
-    pero una tupla dijo siempre "igual que el resto del fichero"."""
+    pero una tupla dijo siempre "igual que el resto del fichero".
+
+    `paths` va envuelto en `_RawPaths` (no una tupla a secas) para que
+    `hash_funcs` lo hashee por NOMBRE de fichero, igual que `load_paths()`
+    — mismo motivo (RAW_DIR es un tempdir distinto por sesión, ver su
+    docstring): sin esto, `load_paths(paths)` de abajo ya devolvía rápido
+    entre sesiones, pero ESTA caché seguía fallando siempre igual y
+    recalculando E.attribute() entero en cada sesión nueva."""
     ds = load_paths(paths)          # ya cacheado aparte — prácticamente gratis si no cambia
+    inputs = _cached_series_inputs(paths, accounts)   # ídem — una vez por (histórico, cuentas)
     return E.attribute(ds, start, end, analysis_currency=currency,
-                       accounts=list(accounts) if accounts else None)
+                       accounts=list(accounts) if accounts else None,
+                       precomputed=inputs)
 
 
 def _attr(start: str, end: str, currency: str | None,
@@ -854,26 +895,28 @@ def _attr(start: str, end: str, currency: str | None,
     st.session_state["paths"] en vez de `ds` (que las vistas SÍ tienen a
     mano) a propósito: es la clave de caché barata que ya usa load_paths(),
     no hace falta arrastrar `ds` hasta aquí para no usarlo."""
-    return _cached_attribute(st.session_state["paths"], start, end, currency,
+    return _cached_attribute(_RawPaths(st.session_state["paths"]), start, end, currency,
                              tuple(accounts) if accounts else None)
 
 
-@st.cache_data(show_spinner=False)
-def _cached_trades(paths: tuple[str, ...], start: str, end: str,
+@st.cache_data(show_spinner=False, hash_funcs={_RawPaths: _stable_cache_key})
+def _cached_trades(paths: _RawPaths, start: str, end: str,
                    accounts: tuple[str, ...] | None):
     """Mismo motivo y mismo patrón que _cached_attribute(): T.build()
     (pestaña Operaciones) también se recalculaba entero en cada rerun de
-    cualquier pestaña, aunque nadie estuviera mirando Operaciones."""
+    cualquier pestaña, aunque nadie estuviera mirando Operaciones. Mismo
+    `_RawPaths` que _cached_attribute(), y por el mismo motivo."""
     ds = load_paths(paths)
     return T.build(ds, start, end, accounts=list(accounts) if accounts else None)
 
 
-@st.cache_data(show_spinner=False)
-def _cached_portfolio(paths: tuple[str, ...], accounts: tuple[str, ...] | None,
+@st.cache_data(show_spinner=False, hash_funcs={_RawPaths: _stable_cache_key})
+def _cached_portfolio(paths: _RawPaths, accounts: tuple[str, ...] | None,
                       currency: str | None, weight_basis: str):
     """Mismo motivo y mismo patrón que _cached_attribute(): T.portfolio()
     (pestaña Cartera) también se recalculaba entero en cada rerun de
-    cualquier pestaña, aunque nadie estuviera mirando Cartera.
+    cualquier pestaña, aunque nadie estuviera mirando Cartera. Mismo
+    `_RawPaths` que _cached_attribute(), y por el mismo motivo.
 
     weight_basis en la clave de caché a propósito: cambiar entre
     "Patrimonio"/"Exposición" en el selector de la pestaña debe recalcular
@@ -2005,7 +2048,7 @@ def style(df: pd.DataFrame, signed: list[str]):
 def operations_view(ds: P.Dataset, accounts: list[str] | None, d0: str, d1: str):
     """§20 — pestaña Operaciones. Divisa local del instrumento, no la divisa
     de análisis de Métricas: son dos preguntas distintas (§20.1)."""
-    detail, aggs = _cached_trades(st.session_state["paths"], d0, d1,
+    detail, aggs = _cached_trades(_RawPaths(st.session_state["paths"]), d0, d1,
                                   tuple(accounts) if accounts else None)
     if not aggs:
         st.info("No hay operaciones en el periodo/cuentas seleccionadas. Esto requiere "
@@ -2144,7 +2187,7 @@ def portfolio_view(ds: P.Dataset, accounts: list[str] | None):
              "solo el pastel y el «% Peso» de la tabla de Posiciones.") or "Patrimonio"
     weight_basis = "exposicion" if weight_label == "Exposición" else "patrimonio"
 
-    snap = _cached_portfolio(st.session_state["paths"],
+    snap = _cached_portfolio(_RawPaths(st.session_state["paths"]),
                              tuple(accounts) if accounts else None, currency, weight_basis)
     if not snap.positions and not snap.cash:
         st.info("No hay posiciones abiertas ni efectivo en las cuentas seleccionadas.")
