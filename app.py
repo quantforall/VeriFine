@@ -2041,7 +2041,7 @@ def equity_chart(s_total: E.Series, s_strat: E.Series, currency: str,
                "retiradas no aparecen como saltos. La divergencia entre ambas "
                "líneas es el efecto divisa acumulado."
                + (f" El benchmark ({bench['name']}) se compara contra la "
-                  "Estrategia, sistema contra sistema y en su divisa local (§15.2)."
+                  "Estrategia, sistema contra sistema y en su divisa local."
                   if bench else ""))
 
 
@@ -2073,7 +2073,7 @@ def drawdown_chart(s_total: E.Series, s_strat: E.Series, currency: str,
     fig.update_layout(hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
     st.caption("Drawdown = caída desde el máximo anterior del índice TWR, sobre "
-               "serie diaria (§14.1). La brecha entre Total y Estrategia es la "
+               "serie diaria. La brecha entre Total y Estrategia es la "
                "caída que aportó la divisa, no las posiciones."
                + (f" {bench['name']} en línea punteada, para ver de un vistazo si "
                   "tu peor caída fue mayor o menor que la del mercado."
@@ -2297,7 +2297,7 @@ def efecto_divisa_view(ds: P.Dataset, accounts: list[str] | None, currency: str,
     try:
         att = _attr(d0, d1, currency, accounts)
     except E.UndefinedReturn as e:
-        st.error(f"La serie tiene un tramo no calculable (§9): {e}")
+        st.error(f"La serie tiene un tramo no calculable: {e}")
         return
 
     section_header("globe", "¿Cuánto te ha costado la divisa?")
@@ -2334,7 +2334,7 @@ def efecto_divisa_view(ds: P.Dataset, accounts: list[str] | None, currency: str,
     st.caption("**Cruce** es el término que falta al sumar Estrategia + Divisa sin más "
               "(estrategia × divisa) — pequeño casi siempre, pero real: sin él, la cascada "
               "no cerraría exacta contra el Total. Estrategia y Divisa no se suman "
-              "directamente (§7): se componen, y este bloque es esa diferencia.")
+              "directamente: se componen, y este bloque es esa diferencia.")
 
     section_header("globe", "Riesgo de divisa")
     rs = M.decompose_risk(att.series_total.returns, att.series_strategy.returns)
@@ -2421,16 +2421,16 @@ def benchmark_section(strat_series: E.Series, rf: float, tickers: list[str],
         st.caption(
             f"Total (con efecto divisa incluido) frente al benchmark en su divisa local (USD) "
             f"— aquí SÍ entra el tipo de cambio en la comparación (a diferencia de la lectura "
-            f"Estrategia, §15.2). Volatilidad y máx. drawdown son del benchmark en solitario; "
-            f"alfa y ratios con rf = {rf*100:.2f} %; la beta va al lado del alfa (§15.5).")
+            f"Estrategia). Volatilidad y máx. drawdown son del benchmark en solitario; "
+            f"alfa y ratios con rf = {rf*100:.2f} %; la beta va al lado del alfa.")
     else:
         st.caption(
-            f"Estrategia (FX-neutral) frente al benchmark en su divisa local (USD), §15.2 — "
+            f"Estrategia (FX-neutral) frente al benchmark en su divisa local (USD) — "
             f"sistema contra sistema, sin efecto divisa. Volatilidad y máx. drawdown son del "
             f"benchmark en solitario; alfa y ratios con rf = {rf*100:.2f} %; "
-            "la beta va al lado del alfa (§15.5).")
+            "la beta va al lado del alfa.")
     if flags:
-        st.caption("Volatilidad/tracking no fiables (calendarios distintos, §15.3): "
+        st.caption("Volatilidad/tracking no fiables (calendarios distintos): "
                    + " · ".join(flags) + ". Se recomienda intersección de calendarios.")
 
 
@@ -2469,7 +2469,7 @@ def operations_view(ds: P.Dataset, accounts: list[str] | None, d0: str, d1: str)
                                   tuple(accounts) if accounts else None)
     if not aggs:
         st.info("No hay operaciones en el periodo/cuentas seleccionadas. Esto requiere "
-                "haber ampliado el Flex Query con la sección Operaciones (§20.3).")
+                "haber ampliado el Flex Query con la sección Operaciones.")
         return
 
     section_header("bar-chart", "P&L por ticker")
@@ -2478,7 +2478,7 @@ def operations_view(ds: P.Dataset, accounts: list[str] | None, d0: str, d1: str)
         "aplica el desglose de efecto divisa de Métricas). El importe siempre sale de "
         "`fifoPnlRealized` de IBKR cuando entrada y salida caen dentro del periodo; si el "
         "periodo recorta una posición abierta desde antes, se recalcula con el precio de "
-        "referencia al inicio del periodo (§20.8) — nunca un `fifoPnlRealized` recortado.")
+        "referencia al inicio del periodo — nunca un `fifoPnlRealized` recortado.")
 
     agg_df = pd.DataFrame([dict(
         Ticker=a.symbol, Tipo=a.kind.capitalize(), Divisa=a.currency,
@@ -2496,7 +2496,7 @@ def operations_view(ds: P.Dataset, accounts: list[str] | None, d0: str, d1: str)
             # columna por el título, no por el dato.
             "%": st.column_config.Column(
                 help="Revalorización sobre el capital base del periodo, ponderado "
-                     "por capital — no la media de los % de cada operación (§20.9)."),
+                     "por capital — no la media de los % de cada operación."),
         })
     st.caption(
         "**Tipo** separa acción, opciones y futuros aunque compartan ticker/subyacente "
@@ -2514,7 +2514,7 @@ def operations_view(ds: P.Dataset, accounts: list[str] | None, d0: str, d1: str)
     n_nd = sum(1 for o in ops if o.entry_source == "no_determinado")
     if n_nd:
         st.warning(f"{n_nd} operación(es) de {chosen.symbol} sin Trade ni Transfer que "
-                   "expliquen el origen (§20.5): el importe es igual de fiable "
+                   "expliquen el origen: el importe es igual de fiable "
                    "(`fifoPnlRealized`), pero no se puede mostrar precio/fecha de entrada real.")
 
     # Una columna cuyo valor es el mismo en TODAS las filas no distingue nada:
@@ -2651,7 +2651,7 @@ def portfolio_view(ds: P.Dataset, accounts: list[str] | None):
         "**Patrimonio** = acciones + efectivo, en la divisa base de la cuenta. **Exposición "
         "total** le añade el nocional bruto de futuros y opciones —largo o corto, sin "
         "compensar entre sí— porque un corto expone al mercado igual que un largo; no es "
-        "capital inmovilizado (mismo criterio que el NAV, §2/NON_NAV_CATEGORIES). Estas dos "
+        "capital inmovilizado (mismo criterio que el NAV). Estas dos "
         "cajitas no cambian con el selector de arriba.")
     if weight_basis == "exposicion":
         st.caption(
@@ -2817,7 +2817,7 @@ def informe_view(ds: P.Dataset, accounts: list[str] | None, currency: str, rf: f
         with st.spinner("Calculando informe…"):
             att = _attr(d0, d1, currency, accounts)
     except E.UndefinedReturn as e:
-        st.error(f"La serie tiene un tramo no calculable (§9): {e}")
+        st.error(f"La serie tiene un tramo no calculable: {e}")
         return
     mt = M.from_series(att.series_total, rf=rf)
     snap = T.portfolio(ds, accounts=accounts, analysis_currency=currency)
@@ -2855,7 +2855,7 @@ def informe_view(ds: P.Dataset, accounts: list[str] | None, currency: str, rf: f
     st.dataframe(style(rent_df, list(vals.keys())), width='stretch', hide_index=True)
     st.caption("Estrategia/Divisa/Total vistos desde cada divisa por separado — la Estrategia "
               "no es idéntica en EUR y USD porque el FX se congela contra una divisa de "
-              "análisis distinta en cada columna (§7).")
+              "análisis distinta en cada columna.")
 
     section_header("activity", "Riesgo")
     top5 = sorted((s for s in snap.pie if s.label not in ("Efectivo", "Otros")),
@@ -2917,7 +2917,7 @@ def informe_view(ds: P.Dataset, accounts: list[str] | None, currency: str, rf: f
         {"label": f"Comisiones ({currency})", "value": f"{costes:+,.2f}",
          "tone": "neg" if costes < 0 else "neutral", "icon": "activity"},
     ])
-    st.caption("Compras/ventas cuentan ejecuciones de `Trade` en el periodo (§20.3), no "
+    st.caption("Compras/ventas cuentan ejecuciones de `Trade` en el periodo, no "
               "operaciones FIFO — una posición que entra en varios lotes cuenta varias veces, "
               "igual que en tu extracto del bróker. Dividendos y comisiones, convertidos a "
               f"{currency} fila a fila con el tipo de cambio de su propia fecha.")
@@ -3380,7 +3380,7 @@ def main():
         format_func=lambda t: B.BENCHMARKS[t]["name"],
         help="Se superpone en los gráficos y en las tarjetas de riesgo de todo el panel.")
     bench_extra = st.sidebar.multiselect(
-        "Añadir más al detalle (§15.5: uno amplio + uno de estilo)",
+        "Añadir más al detalle (uno amplio + uno de estilo)",
         [t for t in bench_keys if t != bench_primary],
         format_func=lambda t: B.BENCHMARKS[t]["name"])
     bench_tickers = [bench_primary] + bench_extra
@@ -3438,9 +3438,6 @@ def main():
                     f"meses (desde {funded[0][6:]}/{funded[0][4:6]}/{funded[0][:4]}), aunque "
                     "tengas más sincronizado. Consigue la licencia completa para "
                     "levantar el límite.")
-        elif funded[0] > ds.dates[0]:
-            st.info(f"Los datos arrancan con NAV positivo el {funded[0][6:]}/{funded[0][4:6]}/"
-                    f"{funded[0][:4]}; los días previos al fondeo no son calculables (§9).")
 
     # Selector de periodo: slider + dos date_input sincronizados en ambos
     # sentidos (mover el slider actualiza las fechas y viceversa). El truco es
@@ -3542,7 +3539,7 @@ def _metricas_tab(ds, currency, rf, accounts, dates, d0, d1, bench_primary, benc
         with st.spinner("Calculando TWR y atribución…"):
             att = _attr(d0, d1, currency, accounts)
     except E.UndefinedReturn as e:
-        st.error(f"La serie tiene un tramo no calculable (§9): {e}")
+        st.error(f"La serie tiene un tramo no calculable: {e}")
         st.stop()
     mt = M.from_series(att.series_total, rf=rf)
     ms = M.from_series(att.series_strategy, rf=rf)
@@ -3645,7 +3642,7 @@ def _metricas_tab(ds, currency, rf, accounts, dates, d0, d1, bench_primary, benc
     # periodo) sin volver a "Estrategia" solo por eso.
     st.caption("Aplica a los tres bloques de abajo — año, ventanas móviles y "
               "benchmark: **Total** incluye el efecto divisa; **Estrategia** "
-              "lo neutraliza (FX-neutral, §7.1).")
+              "lo neutraliza (FX-neutral).")
     magnitud = st.segmented_control("Magnitud", ["Total", "Estrategia"],
                                     default="Estrategia", key="metricas_magnitud",
                                     label_visibility="collapsed") or "Estrategia"
