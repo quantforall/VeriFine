@@ -800,8 +800,45 @@ class _RawPaths(tuple):
     pass
 
 
+# Límites de las cachés de proceso de más abajo — sin esto, cada caché crece
+# SIN TOPE mientras el proceso viva: una entrada por cada combinación de
+# (histórico, cuentas, periodo, divisa...) que CUALQUIER usuario haya
+# tocado alguna vez, nunca se libera sola. Con un usuario no importa; con
+# varios cientos de usuarios *registrados* compartiendo el mismo proceso
+# (Streamlit Cloud no da un proceso por usuario), sí.
+#
+# Medido con una simulación de concurrencia real (ver sesión de rendimiento):
+# en reposo cada usuario nuevo en caché cuesta ~2-3 MB, pero bajo
+# concurrencia de verdad (varios usuarios calculando A LA VEZ, no uno detrás
+# de otro) el pico de memoria TRANSITORIA por usuario ronda los ~40 MB —
+# nada se libera hasta que cada cálculo concurrente termina. Estos límites
+# no evitan ese pico puntual, pero sí evitan que la caché de FONDO crezca
+# sin parar con usuarios que ya no están activos.
+_CACHE_TTL = "12h"            # más que de sobra para que un usuario activo
+                              # el mismo día siga encontrando su caché
+                              # caliente (el objetivo de toda esta sesión);
+                              # bastante para no acumular usuarios de hace
+                              # días/semanas que no han vuelto.
+_CACHE_MAX_DATASETS = 100     # load_paths()/_cached_selfcheck(): una entrada
+                              # por histórico (usuario) — la más pesada.
+_CACHE_MAX_SERIES_INPUTS = 200      # + una dimensión (cuentas)
+_CACHE_MAX_ATTRIBUTE = 500          # la más "multiplicada": años_table()/
+                                    # trailing_table() piden muchos (start,end)
+                                    # distintos por cada usuario/cuentas/divisa
+_CACHE_MAX_TRADES_PORTFOLIO = 200   # una vista a la vez por usuario, no un
+                                    # historial de años como _cached_attribute
+_CACHE_MAX_BENCH = 100        # fetch_bench(): dato de MERCADO, no por
+                              # usuario — el mismo (ticker, periodo) sirve a
+                              # todos, así que ni crece con el número de
+                              # usuarios ni hace falta guardarlo tanto
+                              # tiempo (ya tiene su propia caché en disco,
+                              # ver q4_benchmark.py).
+_CACHE_TTL_BENCH = "6h"
+
+
 @st.cache_data(show_spinner="Parseando extractos…",
-               hash_funcs={tuple: _stable_cache_key})
+               hash_funcs={tuple: _stable_cache_key},
+               max_entries=_CACHE_MAX_DATASETS, ttl=_CACHE_TTL)
 def load_paths(paths: tuple[str, ...]) -> P.Dataset:
     """Cachea por NOMBRE de fichero, no por ruta completa — `paths` trae el
     RAW_DIR de la sesión (un `tempfile.mkdtemp()` distinto cada vez, ver
@@ -842,7 +879,8 @@ def _sync_up_parsed_cache(paths: tuple[str, ...]) -> None:
         ST.sync_up(drive, raw_dir, *names)
 
 
-@st.cache_data(show_spinner=False, hash_funcs={_RawPaths: _stable_cache_key})
+@st.cache_data(show_spinner=False, hash_funcs={_RawPaths: _stable_cache_key},
+               max_entries=_CACHE_MAX_SERIES_INPUTS, ttl=_CACHE_TTL)
 def _cached_series_inputs(paths: _RawPaths, accounts: tuple[str, ...] | None) -> E.SeriesInputs:
     """Envoltorio cacheado de E.precompute_series_inputs() — ver su docstring
     y la de E.SeriesInputs. Clave en `(paths, accounts)` SIN start/end/divisa
@@ -858,7 +896,8 @@ def _cached_series_inputs(paths: _RawPaths, accounts: tuple[str, ...] | None) ->
     return E.precompute_series_inputs(ds, list(accounts) if accounts else None)
 
 
-@st.cache_data(show_spinner=False, hash_funcs={_RawPaths: _stable_cache_key})
+@st.cache_data(show_spinner=False, hash_funcs={_RawPaths: _stable_cache_key},
+               max_entries=_CACHE_MAX_ATTRIBUTE, ttl=_CACHE_TTL)
 def _cached_attribute(paths: _RawPaths, start: str, end: str,
                       currency: str | None, accounts: tuple[str, ...] | None) -> E.Attribution:
     """Envoltorio cacheado de E.attribute() — la llamada más repetida y más
@@ -900,7 +939,8 @@ def _attr(start: str, end: str, currency: str | None,
 
 
 @st.cache_data(show_spinner="Verificando integridad de los datos…",
-               hash_funcs={_RawPaths: _stable_cache_key})
+               hash_funcs={_RawPaths: _stable_cache_key},
+               max_entries=_CACHE_MAX_DATASETS, ttl=_CACHE_TTL)
 def _cached_selfcheck(paths: _RawPaths) -> list[dict]:
     """Envoltorio cacheado de SC.run_checks() — mismo patrón que
     _cached_attribute()/_cached_trades()/_cached_portfolio(): una vez por
@@ -922,7 +962,8 @@ def _cached_selfcheck(paths: _RawPaths) -> list[dict]:
     return SC.run_checks(ds)
 
 
-@st.cache_data(show_spinner=False, hash_funcs={_RawPaths: _stable_cache_key})
+@st.cache_data(show_spinner=False, hash_funcs={_RawPaths: _stable_cache_key},
+               max_entries=_CACHE_MAX_TRADES_PORTFOLIO, ttl=_CACHE_TTL)
 def _cached_trades(paths: _RawPaths, start: str, end: str,
                    accounts: tuple[str, ...] | None):
     """Mismo motivo y mismo patrón que _cached_attribute(): T.build()
@@ -933,7 +974,8 @@ def _cached_trades(paths: _RawPaths, start: str, end: str,
     return T.build(ds, start, end, accounts=list(accounts) if accounts else None)
 
 
-@st.cache_data(show_spinner=False, hash_funcs={_RawPaths: _stable_cache_key})
+@st.cache_data(show_spinner=False, hash_funcs={_RawPaths: _stable_cache_key},
+               max_entries=_CACHE_MAX_TRADES_PORTFOLIO, ttl=_CACHE_TTL)
 def _cached_portfolio(paths: _RawPaths, accounts: tuple[str, ...] | None,
                       currency: str | None, weight_basis: str):
     """Mismo motivo y mismo patrón que _cached_attribute(): T.portfolio()
@@ -1894,7 +1936,8 @@ def trailing_table(ds: P.Dataset, currency: str, rf: float, dates: list[str],
     return pd.DataFrame(rows)
 
 
-@st.cache_data(show_spinner="Descargando benchmark de Yahoo…")
+@st.cache_data(show_spinner="Descargando benchmark de Yahoo…",
+               max_entries=_CACHE_MAX_BENCH, ttl=_CACHE_TTL_BENCH)
 def fetch_bench(ticker: str, start: str, end: str) -> pd.Series:
     return B.fetch_benchmark(ticker, start, end)
 
