@@ -18,7 +18,9 @@ obvia lleva la referencia a la sección de la spec que la justifica.
 from __future__ import annotations
 
 import bisect
+import json
 import logging
+import os
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -242,6 +244,46 @@ def parse_file(path: str) -> dict[str, list]:
     return out
 
 
+def _cache_path(path: str) -> str:
+    return path + ".parsed.json"
+
+
+def parse_file_cached(path: str) -> dict[str, list]:
+    """Como `parse_file()`, con una caché en disco junto al crudo
+    (`<path>.parsed.json`) para no repetir el parseo de XML — con cientos de
+    ventanas acumuladas (backfill + un incremental diario, cada uno un XML
+    nuevo, ver q4_sync.py), volver a parsear TODO el histórico en cada
+    sesión nueva es el grueso del tiempo de carga.
+
+    Válida para siempre sin comprobar nada más (ni mtimes ni hashes): el XML
+    crudo se guarda una vez y nunca se modifica (ver `FlexClient.fetch` en
+    q4_ingest.py) — un `path` dado y su `.parsed.json` son 1:1 mientras
+    ambos existan, así que basta con que la caché exista para confiar en
+    ella.
+
+    `q4_storage.sync_up()` (llamado por quien orquesta la carga, no aquí:
+    este módulo no sabe de Drive — ver cabecera del fichero) sube este
+    fichero junto al crudo, así que la próxima sesión (recarga, otra
+    pestaña, contenedor reciclado) lo hidrata ya hecho y se salta el parseo
+    entero."""
+    cache_path = _cache_path(path)
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            log.warning("Caché de parseo corrupta en %s; se reparsea", cache_path)
+    result = parse_file(path)
+    try:
+        with open(cache_path, "w", encoding="utf-8") as fh:
+            json.dump(result, fh)
+    except OSError:
+        # No crítico: sólo se pierde la ganancia de caché esta vez, el
+        # resultado del parseo ya está devuelto igualmente.
+        log.warning("No se pudo escribir la caché de parseo en %s", cache_path)
+    return result
+
+
 # --------------------------------------------------------------------------
 # Consolidación de varios ficheros
 # --------------------------------------------------------------------------
@@ -257,7 +299,7 @@ def load(paths: list[str]) -> Dataset:
               trades=[], corporate_actions=[])
     base = "EUR"
     for p in paths:
-        r = parse_file(p)
+        r = parse_file_cached(p)
         base = r.pop("base_currency", base)
         for k in acc:
             acc[k].extend(r[k])

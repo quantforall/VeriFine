@@ -312,6 +312,17 @@ def test_download_missing_returns_none():
     assert folder.download("nope.xml") is None
 
 
+def test_download_by_id_skips_the_extra_listing():
+    folder = make_folder()
+    file_id = folder.upload("a.xml", b"contenido")
+    session = folder.session
+    calls_before = len(session.calls)
+    assert folder.download_by_id(file_id) == b"contenido"
+    # una sola llamada (el GET ?alt=media), sin el listado previo que hace
+    # download(name) para resolver el id — ver docstring de download_by_id
+    assert len(session.calls) - calls_before == 1
+
+
 def test_list_files_only_sees_folder_contents():
     folder = make_folder()
     folder.upload("a.xml", b"A")

@@ -321,7 +321,14 @@ class DriveFolder:
         info = self.list_files().get(name)
         if not info:
             return None
-        return self._request("GET", f"{DRIVE_API}/files/{info['id']}",
+        return self.download_by_id(info["id"])
+
+    def download_by_id(self, file_id: str) -> bytes:
+        """Como `download()`, pero sin volver a listar la carpeta antes —
+        para cuando quien llama ya tiene el id de una llamada previa a
+        `list_files()` (típicamente para bajar muchos ficheros a la vez:
+        una lista + N descargas por id, en vez de N+1 listados)."""
+        return self._request("GET", f"{DRIVE_API}/files/{file_id}",
                              params={"alt": "media"}).content
 
     def upload(self, name: str, content: bytes,

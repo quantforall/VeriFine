@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 import pytest
 
@@ -109,6 +111,38 @@ def test_internal_transfer_nets_on_consolidation():
     assert P.flows(ds, ["A", "B"]) == {}                        # T7: interna, se anula
     assert P.flows(ds, ["A"]) == {"20260301": [("EUR", -3000.0)]}  # T8: salida externa
     assert P.flows(ds, ["B"]) == {"20260301": [("EUR", 3000.0)]}   # entrada externa
+
+
+def test_parse_file_cached_writes_sidecar_and_reuses_it(tmp_path):
+    """La primera llamada parsea y escribe `<path>.parsed.json`; si el XML
+    cambia después (no debería pasar nunca en producción — el crudo es
+    inmutable, ver q4_ingest.py — pero así se prueba que de verdad se lee
+    la caché y no se vuelve a tocar el XML), la caché sigue mandando."""
+    p = tmp_path / "mini.xml"
+    p.write_text(_mini_xml(total=800, cash=300, stock=500, options=0,
+                          pos_cat="STK", pos_ccy="USD", pos_value=500))
+    cache_path = tmp_path / "mini.xml.parsed.json"
+
+    first = P.parse_file_cached(str(p))
+    assert cache_path.exists()
+    assert first["nav"][0]["total"] == pytest.approx(800.0)
+
+    p.write_text(_mini_xml(total=999, cash=300, stock=500, options=0,
+                          pos_cat="STK", pos_ccy="USD", pos_value=500))
+    second = P.parse_file_cached(str(p))
+    assert second["nav"][0]["total"] == pytest.approx(800.0)   # de la caché, no del XML nuevo
+
+
+def test_parse_file_cached_reparses_on_corrupt_cache(tmp_path):
+    p = tmp_path / "mini.xml"
+    p.write_text(_mini_xml(total=800, cash=300, stock=500, options=0,
+                          pos_cat="STK", pos_ccy="USD", pos_value=500))
+    cache_path = tmp_path / "mini.xml.parsed.json"
+    cache_path.write_text("{ esto no es json valido")
+
+    result = P.parse_file_cached(str(p))
+    assert result["nav"][0]["total"] == pytest.approx(800.0)   # reparseado del XML
+    assert json.loads(cache_path.read_text())["nav"][0]["total"] == pytest.approx(800.0)  # regenerada
 
 
 def test_currency_buckets_keeps_stocks():

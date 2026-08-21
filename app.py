@@ -770,9 +770,60 @@ def _tab_gate(license_mode: str) -> bool:
 # Carga
 # --------------------------------------------------------------------------
 
-@st.cache_data(show_spinner="Parseando extractos…")
+def _stable_cache_key(paths: tuple) -> str:
+    """Sustituye cada ruta por su nombre de fichero antes de que
+    `st.cache_data` la hashee — ver docstring de `load_paths` para el
+    motivo. Conserva el ORDEN tal cual (nunca `sorted`): el dedup de
+    `P.load()` resuelve solapes con `keep="last"`, así que dos órdenes
+    distintos del MISMO conjunto de ficheros pueden, en teoría, dar un
+    resultado distinto — si esto sonara igual para ambos, se estaría
+    devolviendo el resultado de un orden para una sesión que pidió el otro.
+
+    Devuelve un `str`, no una `tuple`: `hash_funcs` está registrado sobre
+    el tipo `tuple` (para interceptar `paths` antes de que Streamlit lo
+    recorra), y devolver aquí otra tupla hace que Streamlit vuelva a
+    aplicar ESTA MISMA función sobre el resultado (mismo tipo => vuelve a
+    calificar para el override) — recursión infinita en la práctica. Un
+    `str` no vuelve a calificar, así que corta ahí."""
+    return "\x00".join(os.path.basename(p) for p in paths)
+
+
+@st.cache_data(show_spinner="Parseando extractos…",
+               hash_funcs={tuple: _stable_cache_key})
 def load_paths(paths: tuple[str, ...]) -> P.Dataset:
+    """Cachea por NOMBRE de fichero, no por ruta completa — `paths` trae el
+    RAW_DIR de la sesión (un `tempfile.mkdtemp()` distinto cada vez, ver
+    `q4_storage.init_session_storage`), así que con la ruta completa como
+    clave esta caché de proceso NUNCA acertaba entre dos sesiones distintas
+    (recargar la pestaña, abrir otra, que el contenedor se reciclara) —
+    cada una repetía el `P.load()` completo (merge/dedup/bootstrap) aunque
+    fuera exactamente el mismo histórico de siempre. El nombre de fichero sí
+    es estable entre sesiones porque el XML crudo es inmutable por diseño
+    (mismo argumento que `q4_parser.parse_file_cached`)."""
     return P.load(list(paths))
+
+
+def _sync_up_parsed_cache(paths: tuple[str, ...]) -> None:
+    """Sube a Drive los `.parsed.json` que `P.load()` acaba de (re)generar
+    junto a cada crudo de `paths` (ver `q4_parser.parse_file_cached`) — así
+    la próxima sesión (recarga, otra pestaña, contenedor reciclado) los
+    encuentra ya hidratados y se salta el parseo de XML entero.
+
+    Sólo sube los que Drive NO tenga ya (una llamada a `list_files()` para
+    saberlo, no N) — llamar a esto pasa en CADA carga, incluida la de "ya
+    había datos, sólo mostrarlos" (líneas de abajo); sin ese filtro se
+    resubiría sin cambios el mismo fichero en cada sesión, para siempre."""
+    if not paths:
+        return
+    drive = st.session_state.get("_drive_folder")
+    if drive is None:
+        return
+    raw_dir = os.path.dirname(paths[0])
+    known = drive.list_files()
+    names = [n for n in (os.path.basename(p) + ".parsed.json" for p in paths)
+             if n not in known]
+    if names:
+        ST.sync_up(drive, raw_dir, *names)
 
 
 @st.cache_data(show_spinner=False)
@@ -1421,6 +1472,7 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
                     status.write(f"Parseando {len(paths)} extractos…")
                     st.session_state["paths"] = paths
                     load_paths(paths)          # parsea aquí, con feedback visible
+                    _sync_up_parsed_cache(paths)
                     # Sin `expanded=False`: si se colapsa solo, el único rastro de
                     # que ha ido bien es la etiqueta de la caja — fácil de leer
                     # como "no ha pasado nada" (fue justo lo que reportaron). Se
@@ -1438,7 +1490,9 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
         finally:
             _release_sync_lock(state_path)
     if st.session_state.get("paths"):
-        return load_paths(st.session_state["paths"])
+        ds = load_paths(st.session_state["paths"])
+        _sync_up_parsed_cache(st.session_state["paths"])
+        return ds
 
     # Nada sincronizado todavía EN ESTA SESIÓN (recarga de página, sesión
     # nueva): si ya hay extractos en el almacén de una sincronización
@@ -1456,7 +1510,9 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
         # llegaba a activarse en ese caso.
         paths = tuple(local)
         st.session_state["paths"] = paths
-        return load_paths(paths)
+        ds = load_paths(paths)
+        _sync_up_parsed_cache(paths)
+        return ds
     return None
 
 

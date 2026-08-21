@@ -25,10 +25,18 @@ import os
 import logging
 import mimetypes
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from q4_drive import DriveFolder
+from q4_drive import AuthError, DriveError, DriveFolder
 
 log = logging.getLogger("q4.storage")
+
+# Descargas simultáneas al hidratar una sesión nueva — I/O-bound (esperar la
+# respuesta HTTP de Drive), no CPU, así que hilos bastan y no hace falta más
+# concurrencia que ésta: con un histórico de decenas/cientos de crudos
+# acumulados, bajarlos uno a uno en serie es la parte más lenta de abrir la
+# app (varios segundos de solo esperar red antes de ver nada).
+MAX_PARALLEL_DOWNLOADS = 8
 
 
 def init_session_storage(drive: DriveFolder | None) -> str:
@@ -38,15 +46,32 @@ def init_session_storage(drive: DriveFolder | None) -> str:
     local_dir = tempfile.mkdtemp(prefix="verifine_")
     if drive is None:
         return local_dir
-    files = drive.list_files()
+    files = drive.list_files()   # una sola llamada: {name: {"id":..., ...}}
     written = 0
-    for name in files:
-        content = drive.download(name)
-        if content is None:
-            continue
-        with open(os.path.join(local_dir, name), "wb") as fh:
-            fh.write(content)
-        written += 1
+
+    def _fetch(name: str, file_id: str) -> tuple[str, bytes | None]:
+        try:
+            return name, drive.download_by_id(file_id)
+        except AuthError:
+            raise  # token inválido: afecta a TODA la hidratación, no solo a este fichero
+        except DriveError:
+            # p. ej. el fichero se borró entre el listado y la descarga —
+            # antes `download(name)` volvía a listar y esto ya daba None sin
+            # más; con el id ya en mano, el 404 llega como DriveError. Se
+            # omite ese fichero, no se aborta la sesión entera por él.
+            log.warning("No se pudo descargar %s de Drive; se omite esta sesión",
+                       name, exc_info=True)
+            return name, None
+
+    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_DOWNLOADS, len(files)) or 1) as pool:
+        futures = [pool.submit(_fetch, name, info["id"]) for name, info in files.items()]
+        for fut in as_completed(futures):
+            name, content = fut.result()
+            if content is None:
+                continue
+            with open(os.path.join(local_dir, name), "wb") as fh:
+                fh.write(content)
+            written += 1
     log.info("Sesión hidratada desde Drive: %d fichero(s)", written)
     return local_dir
 

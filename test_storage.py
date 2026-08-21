@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 import q4_storage as ST
+from q4_drive import AuthError, DriveError
 
 
 class FakeDriveFolder:
@@ -20,6 +23,10 @@ class FakeDriveFolder:
 
     def download(self, name):
         return self.files.get(name)
+
+    def download_by_id(self, file_id):
+        # En este doble el "id" es el propio nombre (ver list_files).
+        return self.files[file_id]
 
     def upload(self, name, content, mime_type="application/octet-stream"):
         self.files[name] = content
@@ -44,6 +51,47 @@ def test_init_session_storage_hydrates_from_drive():
     local = ST.init_session_storage(drive)
     assert set(os.listdir(local)) == {"state_Q1.json", "a.xml"}
     assert open(os.path.join(local, "a.xml"), "rb").read() == b"<xml/>"
+
+
+def test_init_session_storage_hydrates_many_files_in_parallel():
+    # No hay forma sencilla de observar "en paralelo" desde fuera sin
+    # cronómetro (frágil en CI) — lo que sí se puede comprobar es que la
+    # paralelización no cambia el resultado: con más ficheros que
+    # MAX_PARALLEL_DOWNLOADS, todos llegan igual, completos y correctos.
+    drive = FakeDriveFolder()
+    n = ST.MAX_PARALLEL_DOWNLOADS * 3 + 1
+    for i in range(n):
+        drive.files[f"f{i}.xml"] = f"<xml id={i}/>".encode()
+    local = ST.init_session_storage(drive)
+    assert set(os.listdir(local)) == set(drive.files)
+    for i in range(n):
+        content = open(os.path.join(local, f"f{i}.xml"), "rb").read()
+        assert content == f"<xml id={i}/>".encode()
+
+
+def test_init_session_storage_skips_file_that_disappears_mid_hydration():
+    class FlakyDriveFolder(FakeDriveFolder):
+        def download_by_id(self, file_id):
+            if file_id == "gone.xml":
+                raise DriveError("404: ya no existe")
+            return super().download_by_id(file_id)
+
+    drive = FlakyDriveFolder()
+    drive.files["gone.xml"] = b"X"
+    drive.files["ok.xml"] = b"OK"
+    local = ST.init_session_storage(drive)
+    assert set(os.listdir(local)) == {"ok.xml"}
+
+
+def test_init_session_storage_propagates_auth_error():
+    class DeadTokenDriveFolder(FakeDriveFolder):
+        def download_by_id(self, file_id):
+            raise AuthError("token revocado")
+
+    drive = DeadTokenDriveFolder()
+    drive.files["a.xml"] = b"A"
+    with pytest.raises(AuthError):
+        ST.init_session_storage(drive)
 
 
 def test_sync_up_uploads_existing_files_only(tmp_path):
