@@ -740,12 +740,17 @@ def license_gate() -> str:
         return "full"
 
     # No autoriza: NO se toca el último código válido guardado — un
-    # intento fallido (typo, código de otro mes) no debe borrar el bueno.
+    # intento fallido (typo, código de otro mes, fallo de red al verificar)
+    # no debe borrar el bueno. Se muestra el motivo REAL (`msg`, de
+    # evaluate()) — antes se descartaba y siempre salía el mismo texto
+    # genérico de "Modo de prueba", así que un fallo al pedir el Gist
+    # (red, URL mal puesta en Secrets, lo que sea) era indistinguible de
+    # un código realmente erróneo, sin ninguna pista para depurarlo.
+    st.error(msg)
     st.info(f"**Modo de prueba** — el análisis se limita a {TRIAL_MONTHS} meses "
            "(puedes descargar todo el histórico que quieras igualmente) y "
            "Efecto divisa/Operaciones/Informe quedan bloqueadas hasta verificar "
-           "la licencia. El código está en el último correo de pago de tu "
-           "suscripción de Substack.")
+           "la licencia.")
     return "trial"
 
 
