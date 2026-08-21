@@ -31,6 +31,8 @@ pueda contener uno.
 from __future__ import annotations
 
 import json
+import time
+import random
 import logging
 import uuid
 import datetime as dt
@@ -39,7 +41,11 @@ from urllib.parse import urlencode
 
 import requests
 
+import q4_probe as PR
+
 log = logging.getLogger("q4.drive")
+
+_rate_limited = PR.Counter("drive_rate_limited")
 
 AUTH_BASE = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -58,6 +64,15 @@ POINTER_NAME = "verifine_pointer.json"
 LOCK_STALE_S = 900          # mismo umbral que el .lock local de app.py hoy
 
 REQUEST_TIMEOUT = 30
+
+# Reintentos con backoff SOLO para 429 (cuota) y 5xx (Google caído/ocupado) —
+# nunca para el resto de 4xx, que son errores reales (permiso, fichero
+# borrado, etc.) y reintentarlos sólo tapa el síntoma. Antes cualquier
+# >=400 lanzaba DriveError de inmediato: un pico de sesiones abriendo a la
+# vez convertía un 429 pasajero en un error visible para el usuario en vez
+# de una espera corta (ver diagnóstico de escalabilidad, Fase 1).
+RETRY_ATTEMPTS = 3
+RETRY_BASE_DELAY_S = 0.5
 
 
 class DriveError(RuntimeError):
@@ -199,19 +214,46 @@ class DriveFolder:
     tokens: DriveTokens
     folder_id: str
     session: requests.Session = field(default_factory=requests.Session)
+    # Cachés EN MEMORIA compartidas por todo el árbol de esta sesión —
+    # `subfolder()` propaga el MISMO dict (no una copia) a cada hijo que
+    # construye, así que lo que una llamada resuelve lo ven las demás sin
+    # volver a pedirlo. Sólo dos claves, pobladas perezosamente:
+    #   "subfolders": {(folder_id_padre, nombre): folder_id_hijo}
+    #   "files":      {folder_id: {nombre: {"id":..., "modifiedTime":...}}}
+    # Deliberadamente NO se usa para `list_files()` en sí (eso sigue yendo
+    # siempre a red, ver más abajo) — sólo para el check-antes-de-escribir
+    # de `upload()`/`delete()`, que ya se auto-invalida con cada escritura
+    # propia. `acquire_lock()`/`release_lock()` tampoco la usan a propósito:
+    # coordinan ENTRE sesiones, así que necesitan ver siempre el estado real
+    # de Drive, no uno que otra sesión pudo dejar desactualizado aquí.
+    _cache: dict = field(default_factory=dict)
 
     # -- transporte ---------------------------------------------------------
 
     def _request(self, method: str, url: str, **kwargs) -> requests.Response:
         headers = {"Authorization": f"Bearer {self.tokens.access_token}",
                    **kwargs.pop("headers", {})}
-        r = self.session.request(method, url, headers=headers,
-                                 timeout=REQUEST_TIMEOUT, **kwargs)
-        if r.status_code == 401:
-            raise AuthError(f"Google rechazó el token: {r.text[:200]}")
-        if r.status_code >= 400:
-            raise DriveError(f"Drive API {method} {url} -> {r.status_code}: {r.text[:200]}")
-        return r
+        delay = RETRY_BASE_DELAY_S
+        for attempt in range(1, RETRY_ATTEMPTS + 1):
+            r = self.session.request(method, url, headers=headers,
+                                     timeout=REQUEST_TIMEOUT, **kwargs)
+            if r.status_code == 401:
+                raise AuthError(f"Google rechazó el token: {r.text[:200]}")
+            retryable = r.status_code == 429 or r.status_code >= 500
+            if retryable and attempt < RETRY_ATTEMPTS:
+                _rate_limited.hit(status=r.status_code, method=method)
+                # Jitter (±25%) para que sesiones que chocaron con la misma
+                # ventana de cuota no vuelvan a intentarlo todas en el mismo
+                # instante — sin esto, el reintento sincronizado puede
+                # recrear el mismo pico que lo causó.
+                time.sleep(delay * random.uniform(0.75, 1.25))
+                delay *= 2
+                continue
+            if r.status_code >= 400:
+                raise DriveError(f"Drive API {method} {url} -> {r.status_code}: {r.text[:200]}")
+            return r
+        raise DriveError(f"Drive API {method} {url} -> {r.status_code} tras "
+                         f"{RETRY_ATTEMPTS} intentos: {r.text[:200]}")
 
     def _upload_multipart(self, metadata: dict, content: bytes, mime_type: str) -> str:
         boundary = uuid.uuid4().hex
@@ -270,12 +312,24 @@ class DriveFolder:
         list_files/upload/download/delete no cambian, sólo dependen de
         `folder_id` — así que funcionan igual sin más código.
 
-        Se resuelve de nuevo en cada llamada (no se cachea el id en
-        memoria), igual que `resolve_or_create()` — consistente con que
-        nada aquí memoriza resultados de la API entre llamadas."""
-        found = self._find_child_folder(name)
-        folder_id = found["id"] if found else self._create_child_folder(name)
-        return DriveFolder(tokens=self.tokens, folder_id=folder_id, session=self.session)
+        El `folder_id` resuelto SÍ se cachea en memoria (en `self._cache`,
+        compartida con el hijo devuelto — ver el campo en la clase): dentro
+        de una misma sesión, `subfolder("XML")` no cambia de un rerun de
+        Streamlit a otra llamada — antes se re-resolvía (una búsqueda GET)
+        en CADA llamada, aunque fuera la carpeta de siempre. La carpeta
+        creada una vez no se borra sola, así que no hay riesgo de servir un
+        id obsoleto salvo que alguien la borre a mano en Drive — ese caso ya
+        no estaba cubierto tampoco antes de esto (no hay reintento de
+        creación si `folder_id` deja de existir a media sesión)."""
+        key = (self.folder_id, name)
+        subfolders = self._cache.setdefault("subfolders", {})
+        folder_id = subfolders.get(key)
+        if folder_id is None:
+            found = self._find_child_folder(name)
+            folder_id = found["id"] if found else self._create_child_folder(name)
+            subfolders[key] = folder_id
+        return DriveFolder(tokens=self.tokens, folder_id=folder_id, session=self.session,
+                           _cache=self._cache)
 
     def _find_child_folder(self, name: str) -> dict | None:
         r = self._request("GET", f"{DRIVE_API}/files", params={
@@ -360,30 +414,59 @@ class DriveFolder:
         return self._request("GET", f"{DRIVE_API}/files/{file_id}",
                              params={"alt": "media"}).content
 
+    def _known_files(self) -> dict[str, dict]:
+        """Índice de esta carpeta, EN CACHÉ para `upload()`/`delete()` —
+        el primero de los dos que se llame en la sesión hace el
+        `list_files()` real; los siguientes (de esta carpeta o de otra
+        `DriveFolder` que apunte al mismo `folder_id`, gracias a `_cache`
+        compartida) lo reutilizan. Cada `upload()`/`delete()` propio
+        actualiza esta misma entrada, así que nunca sirve un id que ELLOS
+        mismos acaban de invalidar — ver el campo `_cache` en la clase para
+        la salvedad de otra sesión escribiendo el mismo nombre por fuera."""
+        by_folder = self._cache.setdefault("files", {})
+        if self.folder_id not in by_folder:
+            by_folder[self.folder_id] = self.list_files()
+        return by_folder[self.folder_id]
+
     def upload(self, name: str, content: bytes,
               mime_type: str = "application/octet-stream") -> str:
         """Crea `name` en la carpeta si no existe, o sobrescribe su contenido
         si ya existe. Devuelve el fileId."""
-        existing = self.list_files().get(name)
+        known = self._known_files()
+        existing = known.get(name)
         if existing:
             self._request("PATCH", f"{UPLOAD_API}/files/{existing['id']}",
                           params={"uploadType": "media"}, data=content,
                           headers={"Content-Type": mime_type})
             return existing["id"]
-        return self._upload_multipart({"name": name, "parents": [self.folder_id]},
-                                      content, mime_type)
+        file_id = self._upload_multipart({"name": name, "parents": [self.folder_id]},
+                                         content, mime_type)
+        known[name] = {"id": file_id, "modifiedTime": ""}
+        return file_id
 
     def delete(self, name: str) -> None:
-        info = self.list_files().get(name)
+        known = self._known_files()
+        info = known.get(name)
         if info:
             self._request("DELETE", f"{DRIVE_API}/files/{info['id']}")
+            known.pop(name, None)  # después de que la llamada tenga éxito —
+                                    # si _request lanza, el índice se queda
+                                    # como estaba, no como si ya se hubiera
+                                    # borrado
 
     # -- cerrojo consultivo (mismo nivel de garantía que el .lock local) ------
 
     def acquire_lock(self, name: str, stale_seconds: int = LOCK_STALE_S) -> bool:
         """No es atómico — best-effort para el caso normal de una sesión a la
         vez, igual que el `.lock` de fichero local que sustituye. Si el
-        cerrojo existe y es reciente, no se adquiere."""
+        cerrojo existe y es reciente, no se adquiere.
+
+        La decisión de arriba usa `list_files()` SIN caché (siempre red,
+        siempre el estado real de Drive — ver el campo `_cache` de la
+        clase); sólo la escritura de abajo (`self.upload`) pasa por la
+        caché de esta sesión, y sólo para decidir CREATE vs PATCH — el
+        resultado final (el cerrojo queda escrito, con timestamp fresco) es
+        el mismo en ambos casos."""
         info = self.list_files().get(name)
         if info:
             try:

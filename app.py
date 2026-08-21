@@ -19,12 +19,15 @@ import time
 import glob
 import shutil
 import uuid
+import logging
+import threading
 import datetime as dt
 
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 import plotly.graph_objects as go
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 import q4_parser as P
 import q4_engine as E
@@ -35,6 +38,9 @@ import q4_selfcheck as SC
 import q4_trades as T
 import q4_drive as D
 import q4_storage as ST
+import q4_probe as PR
+
+log = logging.getLogger("q4.app")
 
 st.set_page_config(page_title="VeriFine", page_icon=":bar_chart:", layout="wide")
 
@@ -784,7 +790,25 @@ def _stable_cache_key(paths: tuple) -> str:
     recorra), y devolver aquí otra tupla hace que Streamlit vuelva a
     aplicar ESTA MISMA función sobre el resultado (mismo tipo => vuelve a
     calificar para el override) — recursión infinita en la práctica. Un
-    `str` no vuelve a calificar, así que corta ahí."""
+    `str` no vuelve a calificar, así que corta ahí.
+
+    INVARIANTE DE AISLAMIENTO (Fase 0 del plan de escalabilidad — revisada
+    explícitamente porque esta caché es de PROCESO, compartida entre TODAS
+    las sesiones/usuarios de Streamlit Cloud): dos sesiones sólo pueden
+    acertar la misma entrada si sus `paths` dan el MISMO nombre de fichero.
+    Todo XML de producción lo escribe `q4_ingest.FlexClient.fetch()` como
+    `{query_id}_{tag}_{timestamp}_{sha256(contenido)[:12]}.xml` — el nombre
+    ya incorpora el Query ID de IBKR del usuario (credencial privada, ver
+    `q4_storage.py` sobre cómo se guarda) Y un hash del contenido real. Para
+    que dos sesiones de USUARIOS DISTINTOS colisionaran aquí, haría falta
+    que compartieran `query_id` (algo que depende de que IBKR no reutilice
+    ese ID entre cuentas — no verificado contra la documentación de IBKR,
+    pero query_id ya es en sí mismo un secreto por-cuenta) Y que el
+    contenido descargado fuera bit a bit idéntico. No hay ninguna vía en la
+    app (no hay `st.file_uploader`, ver app.py) para que un nombre de
+    fichero arbitrario/no generado por FlexClient entre en `paths`. Ver
+    `test_stable_cache_key_does_not_collide_across_different_content` en
+    test_app_cache.py."""
     return "\x00".join(os.path.basename(p) for p in paths)
 
 
@@ -814,6 +838,14 @@ class _RawPaths(tuple):
 # nada se libera hasta que cada cálculo concurrente termina. Estos límites
 # no evitan ese pico puntual, pero sí evitan que la caché de FONDO crezca
 # sin parar con usuarios que ya no están activos.
+#
+# PENDIENTE DE REVISIÓN (Fase 2 del plan de escalabilidad): estos números
+# son un punto de partida razonable, no una cifra derivada de carga real a
+# 300 sesiones — bajo esa carga, el LRU de `max_entries` puede expulsar
+# entradas todavía activas antes de que su TTL expire, justo cuando más
+# falta hace la caché. NO subirlos a ciegas (eso es sólo más RAM por
+# proceso, no más usuarios fluidos con margen) — ajustar con los datos que
+# dé la instrumentación de q4_probe (Fase 0) bajo un load test real (Fase 5).
 _CACHE_TTL = "12h"            # más que de sobra para que un usuario activo
                               # el mismo día siga encontrando su caché
                               # caliente (el objetivo de toda esta sesión);
@@ -849,7 +881,8 @@ def load_paths(paths: tuple[str, ...]) -> P.Dataset:
     fuera exactamente el mismo histórico de siempre. El nombre de fichero sí
     es estable entre sesiones porque el XML crudo es inmutable por diseño
     (mismo argumento que `q4_parser.parse_file_cached`)."""
-    return P.load(list(paths))
+    with PR.timed("load_paths", n_files=len(paths)):
+        return P.load(list(paths))
 
 
 def _sync_up_parsed_cache(paths: tuple[str, ...]) -> None:
@@ -920,11 +953,12 @@ def _cached_attribute(paths: _RawPaths, start: str, end: str,
     docstring): sin esto, `load_paths(paths)` de abajo ya devolvía rápido
     entre sesiones, pero ESTA caché seguía fallando siempre igual y
     recalculando E.attribute() entero en cada sesión nueva."""
-    ds = load_paths(paths)          # ya cacheado aparte — prácticamente gratis si no cambia
-    inputs = _cached_series_inputs(paths, accounts)   # ídem — una vez por (histórico, cuentas)
-    return E.attribute(ds, start, end, analysis_currency=currency,
-                       accounts=list(accounts) if accounts else None,
-                       precomputed=inputs)
+    with PR.timed("cached_attribute_miss", n_files=len(paths), accounts=len(accounts or ())):
+        ds = load_paths(paths)          # ya cacheado aparte — prácticamente gratis si no cambia
+        inputs = _cached_series_inputs(paths, accounts)   # ídem — una vez por (histórico, cuentas)
+        return E.attribute(ds, start, end, analysis_currency=currency,
+                           accounts=list(accounts) if accounts else None,
+                           precomputed=inputs)
 
 
 def _attr(start: str, end: str, currency: str | None,
@@ -958,8 +992,78 @@ def _cached_selfcheck(paths: _RawPaths) -> list[dict]:
     _cached_series_inputs) se repetía en CADA interacción, no una vez por
     dataset como decía el comentario original. Medido: ~75 ms por rerun en
     un dataset sintético de 6 años/2 cuentas — en una cuenta real, más."""
-    ds = load_paths(paths)
-    return SC.run_checks(ds)
+    with PR.timed("cached_selfcheck_miss", n_files=len(paths)):
+        ds = load_paths(paths)
+        return SC.run_checks(ds)
+
+
+# Fase 4 del plan de escalabilidad (precálculo dentro de la sesión): la
+# caché de _cached_selfcheck() de arriba es de PROCESO — rápida entre
+# sesiones MIENTRAS el proceso siga vivo, pero no sobrevive a un
+# reciclado/redeploy del contenedor de Streamlit Cloud. Este artefacto en
+# el Drive del propio usuario sí — un fichero pequeño (JSON de
+# resultados, no el histórico) por carpeta VeriFine, no uno por sesión.
+_SELFCHECK_ARTIFACT_NAME = "selfcheck_cache.json"
+
+
+def _load_precomputed_selfcheck(drive: D.DriveFolder, fingerprint: str) -> list[dict] | None:
+    """`None` si no hay artefacto, si no se pudo leer, o si no coincide con
+    `fingerprint` (la MISMA huella que usa `_stable_cache_key` — el nombre
+    de fichero ya es content-addressed, ver su docstring, así que si
+    coincide es exactamente la entrada que `_cached_selfcheck()` habría
+    calculado)."""
+    try:
+        raw = drive.download(_SELFCHECK_ARTIFACT_NAME)
+        if raw is None:
+            return None
+        data = json.loads(raw)
+        if data.get("fingerprint") != fingerprint:
+            return None
+        return data.get("issues", [])
+    except Exception:
+        log.warning("No se pudo leer el artefacto precalculado de selfcheck; se recalcula",
+                   exc_info=True)
+        return None
+
+
+def _persist_precomputed_selfcheck(drive: D.DriveFolder, fingerprint: str,
+                                   issues: list[dict]) -> None:
+    """Falla en silencio (sólo log) a propósito: esto es una optimización
+    de arranque, nunca debe poder romper una sincronización que por lo
+    demás fue bien — ver el uso en `_selfcheck_with_drive_cache`, que la
+    lanza en segundo plano."""
+    try:
+        body = json.dumps({"fingerprint": fingerprint, "issues": issues}).encode("utf-8")
+        drive.upload(_SELFCHECK_ARTIFACT_NAME, body, "application/json")
+    except Exception:
+        log.warning("No se pudo persistir el artefacto precalculado de selfcheck",
+                   exc_info=True)
+
+
+def _selfcheck_with_drive_cache(paths: tuple[str, ...]) -> list[dict]:
+    """Envoltorio de `_cached_selfcheck()` que primero intenta el artefacto
+    de Drive (ver arriba) — sólo importa en un proceso FRÍO (la caché de
+    proceso de `_cached_selfcheck` está vacía): si hay un artefacto que
+    coincide, se salta `SC.run_checks()` (varios recorridos completos del
+    histórico, ver su docstring) enteramente en el primer render.
+
+    Sin Drive conectado (Q4_STORAGE_BACKEND=local), o sin artefacto/sin
+    coincidencia, cae en `_cached_selfcheck()` de siempre — que sí sigue
+    cacheada en PROCESO para el resto de la sesión — y sube el resultado a
+    Drive en segundo plano (no bloquea el render) para la próxima vez."""
+    fingerprint = _stable_cache_key(tuple(paths))
+    drive = st.session_state.get("_drive_folder")
+
+    if drive is not None:
+        cached = _load_precomputed_selfcheck(drive, fingerprint)
+        if cached is not None:
+            return cached
+
+    issues = _cached_selfcheck(_RawPaths(paths))
+    if drive is not None:
+        _run_in_background("persist-selfcheck",
+                           lambda: _persist_precomputed_selfcheck(drive, fingerprint, issues))
+    return issues
 
 
 @st.cache_data(show_spinner=False, hash_funcs={_RawPaths: _stable_cache_key},
@@ -1132,12 +1236,71 @@ def _drive_gate() -> D.DriveFolder | None:
         st.error(f"No se pudo acceder a tu carpeta de Drive: {e}")
         st.stop()
 
-    RAW_DIR = ST.init_session_storage(drive)
+    RAW_DIR = ST.init_session_storage(drive, session_id=_probe_session_id())
     LICENSE_PATH = os.path.join(RAW_DIR, "license.json")
     IBKR_CREDS_PATH = os.path.join(RAW_DIR, "ibkr_credentials.json")
     st.session_state["_raw_dir"] = RAW_DIR
     st.session_state["_drive_folder"] = drive
     return drive
+
+
+def _probe_session_id() -> str:
+    """Identificador corto, sólo para correlacionar líneas de métrica (ver
+    q4_probe) de la MISMA sesión en los logs — para poder contar sesiones
+    concurrentes reales más adelante (Fase 0 del plan de escalabilidad), no
+    usuarios registrados. No es un id de seguridad ni de auditoría; vive en
+    session_state, así que sobrevive a los reruns pero no a una recarga de
+    pestaña (eso SÍ cuenta como una sesión nueva a efectos de medir)."""
+    sid = st.session_state.get("_probe_session_id")
+    if sid is None:
+        sid = uuid.uuid4().hex[:12]
+        st.session_state["_probe_session_id"] = sid
+    return sid
+
+
+def _run_in_background(name: str, fn) -> None:
+    """Lanza `fn` en un hilo daemon aparte, con el ScriptRunContext de
+    Streamlit propagado (`add_script_run_ctx`) para que pueda tocar
+    `session_state` con seguridad. Usado por el pre-warm de benchmarks
+    (Fase 3) y el precálculo de la vista por defecto (Fase 4) del plan de
+    escalabilidad: ninguno de los dos debe bloquear el render principal ni
+    alargar el tiempo hasta la primera pantalla útil.
+
+    `fn` debe capturar sus propios errores — una excepción sin capturar en
+    un hilo así no llega a Streamlit, sólo se pierde en el log del proceso
+    (sin romper la sesión, pero sin avisar tampoco: mejor que cada `fn`
+    decida qué hacer con sus propios fallos, ver los usos)."""
+    thread = threading.Thread(target=fn, daemon=True, name=f"verifine-{name}")
+    add_script_run_ctx(thread)
+    thread.start()
+
+
+def _prewarm_benchmarks_in_background(ds: P.Dataset) -> None:
+    """Descarga en segundo plano los tickers por defecto (`B.DEFAULT_SET`)
+    sobre el rango de fechas del histórico ya cargado — sin bloquear el
+    render principal (Fase 3 del plan de escalabilidad a 300 usuarios). Si
+    el usuario llega a la pestaña Benchmark antes de que termine, cae en el
+    camino síncrono de siempre (`fetch_benchmark` ya cachea en disco, ver
+    q4_benchmark.py) — esto sólo ADELANTA el momento en que se descarga,
+    nunca sustituye la vía de red.
+
+    Una vez por sesión (marcado en `session_state`): Streamlit reejecuta
+    `main()` en cada rerun, así que sin esta guarda se relanzaría el hilo en
+    cada clic."""
+    if st.session_state.get("_bench_prewarmed") or not ds.dates:
+        return
+    st.session_state["_bench_prewarmed"] = True
+    start, end = ds.dates[0], ds.dates[-1]
+
+    def _warm():
+        for ticker in B.DEFAULT_SET:
+            try:
+                B.fetch_benchmark(ticker, start, end)
+            except Exception:
+                log.warning("Pre-warm de benchmark %s falló; se reintentará bajo "
+                           "demanda cuando el usuario abra Benchmark", ticker, exc_info=True)
+
+    _run_in_background("bench-prewarm", _warm)
 
 
 def _connection_fields() -> tuple[str, str]:
@@ -1307,6 +1470,49 @@ def _resolve_raw_path(window: list) -> str:
     return os.path.join(RAW_DIR, os.path.basename(window[2]))
 
 
+def _run_with_heartbeat(work) -> None:
+    """Ejecuta `work()` — una llamada bloqueante que ya actualiza su propia
+    UI por dentro (status.write()/bar.progress()/etc, callbacks de
+    q4_ingest/q4_sync, sin cambios) — en un hilo aparte con el
+    ScriptRunContext de Streamlit propagado (`add_script_run_ctx`), para
+    que esas llamadas a `st.*` sigan funcionando exactamente igual que sin
+    hilo de por medio.
+
+    Mientras `work()` corre, el hilo PRINCIPAL — el que sostiene la
+    conexión HTTP/websocket de esta sesión — manda un pulso propio cada
+    ~1s, INDEPENDIENTE de cada cuánto tiquee `work()` por dentro. Los
+    callbacks de IBKR ya avisan periódicamente (ver q4_ingest.py), pero su
+    backoff llega hasta 60s entre avisos — en producción eso a veces ha
+    bastado para que un proxy intermedio corte la conexión igualmente (ver
+    el docstring de `FlexClient.fetch`, "recargué la página y los datos ya
+    estaban"). Este pulso, de cadencia FIJA en vez de la del propio
+    trabajo, es la garantía adicional (Fase 3 del plan de escalabilidad).
+
+    Si `work()` deja escapar una excepción (no la captura ella misma), se
+    relanza aquí en el hilo PRINCIPAL — para que el try/except de quien
+    llama seguisa funcionando igual que si no hubiera hilo de por medio."""
+    result: dict = {}
+
+    def _run():
+        try:
+            work()
+        except Exception as e:
+            result["error"] = e
+
+    thread = threading.Thread(target=_run, daemon=True, name="verifine-sync-worker")
+    add_script_run_ctx(thread)
+    thread.start()
+    heartbeat = st.empty()
+    elapsed = 0
+    while thread.is_alive():
+        elapsed += 1
+        heartbeat.caption(f"⏳ Sigue en marcha… ({elapsed}s)")
+        thread.join(timeout=1.0)
+    heartbeat.empty()
+    if "error" in result:
+        raise result["error"]
+
+
 def _run_incremental_sync(token: str, qid: str, state_path: str):
     """Sincronización incremental manual: el mismo q4_sync.daily_job() que
     usa el cron (q4_daily.py), disparado a mano — para quien no tiene el
@@ -1323,50 +1529,53 @@ def _run_incremental_sync(token: str, qid: str, state_path: str):
         client = FlexClient(token=token, query_id=qid, raw_dir=RAW_DIR)
         with st.status("Sincronizando desde el último día…", expanded=True) as status:
             bar = st.progress(0.0)
-            try:
-                # Antes esto era un único status.write() estático seguido de
-                # una llamada bloqueante entera — mientras IBKR genera el
-                # informe (asíncrono en su lado, puede ser la parte más
-                # larga) no había ninguna señal de que algo seguía en marcha.
-                # on_progress da 3 pasos fijos (ver daily_job() en q4_sync.py)
-                # en vez de dejarlo mudo.
+
+            def _sync_body():
+                # daily_job() se llama desde un hilo aparte (ver
+                # _run_with_heartbeat) — status.write()/bar.progress() aquí
+                # dentro siguen funcionando igual gracias a
+                # add_script_run_ctx, y el pulso independiente de cadencia
+                # fija lo pone _run_with_heartbeat, no este callback.
                 def _tick(i, n, msg):
                     bar.progress(i / n)
                     status.write(f"({i}/{n}) {msg}")
 
-                res = daily_job(client, state_path, qid, _incremental_parse_fn,
-                                _incremental_recompute_fn, on_progress=_tick)
-                bar.progress(1.0)
-                if res["status"] == "ok":
-                    status.update(label="Sincronización completa", state="complete")
-                    wm = res.get("watermark", "")
-                    wm_fmt = (dt.datetime.strptime(wm, "%Y%m%d").strftime("%d/%m/%Y")
-                              if wm else "—")
-                    st.session_state.pop("paths", None)  # recargar de disco, no lo de la sesión
-                    st.success(f"Al día: {wm_fmt}. "
-                              f"{len(res.get('new_dates', []))} sesión(es) nueva(s).")
-                    if res.get("golden_drift"):
-                        st.warning("Los años cerrados han cambiado: " +
-                                  " · ".join(res["golden_drift"]))
-                    if res.get("raw_path"):
-                        ST.sync_up(st.session_state.get("_drive_folder"), RAW_DIR,
-                                  os.path.basename(res["raw_path"]),
-                                  os.path.basename(state_path))
-                elif res["status"] == "no_new_data":
-                    status.update(label="Ya estabas al día", state="complete")
-                    st.info("Sin sesiones nuevas — nada que traer.")
-                    if res.get("raw_path"):
-                        # El XML ya se descargó (aunque no trajera fechas
-                        # nuevas) — se sube igual para no perderlo de vista
-                        # en cuanto termine esta sesión.
-                        ST.sync_up(st.session_state.get("_drive_folder"), RAW_DIR,
-                                  os.path.basename(res["raw_path"]))
-                else:
-                    status.update(label="No se pudo sincronizar", state="error")
-                    st.error(res.get("reason", res["status"]))
-            except Exception as e:
-                status.update(label="Error en la sincronización", state="error")
-                st.error(str(e))
+                try:
+                    res = daily_job(client, state_path, qid, _incremental_parse_fn,
+                                    _incremental_recompute_fn, on_progress=_tick)
+                    bar.progress(1.0)
+                    if res["status"] == "ok":
+                        status.update(label="Sincronización completa", state="complete")
+                        wm = res.get("watermark", "")
+                        wm_fmt = (dt.datetime.strptime(wm, "%Y%m%d").strftime("%d/%m/%Y")
+                                  if wm else "—")
+                        st.session_state.pop("paths", None)  # recargar de disco, no lo de la sesión
+                        st.success(f"Al día: {wm_fmt}. "
+                                  f"{len(res.get('new_dates', []))} sesión(es) nueva(s).")
+                        if res.get("golden_drift"):
+                            st.warning("Los años cerrados han cambiado: " +
+                                      " · ".join(res["golden_drift"]))
+                        if res.get("raw_path"):
+                            ST.sync_up(st.session_state.get("_drive_folder"), RAW_DIR,
+                                      os.path.basename(res["raw_path"]),
+                                      os.path.basename(state_path))
+                    elif res["status"] == "no_new_data":
+                        status.update(label="Ya estabas al día", state="complete")
+                        st.info("Sin sesiones nuevas — nada que traer.")
+                        if res.get("raw_path"):
+                            # El XML ya se descargó (aunque no trajera fechas
+                            # nuevas) — se sube igual para no perderlo de vista
+                            # en cuanto termine esta sesión.
+                            ST.sync_up(st.session_state.get("_drive_folder"), RAW_DIR,
+                                      os.path.basename(res["raw_path"]))
+                    else:
+                        status.update(label="No se pudo sincronizar", state="error")
+                        st.error(res.get("reason", res["status"]))
+                except Exception as e:
+                    status.update(label="Error en la sincronización", state="error")
+                    st.error(str(e))
+
+            _run_with_heartbeat(_sync_body)
     finally:
         _release_sync_lock(state_path)
 
@@ -1502,6 +1711,14 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
                 "a que termine.")
             return None
 
+        # `signal["abort"]` sustituye a los `return None` que había antes
+        # DENTRO del cuerpo de la sincronización: ahora ese cuerpo corre en
+        # un hilo aparte (ver _run_with_heartbeat/_backfill_body más abajo),
+        # así que un `return` allí dentro sólo saldría de esa función, no
+        # de sidebar_source() — la señal es lo que permite that el `return
+        # None` de más abajo (tras liberar el candado) siga pasando en los
+        # mismos casos que antes: query inválida, o cualquier excepción.
+        signal: dict = {}
         try:
             client = FlexClient(token=token, query_id=qid, raw_dir=RAW_DIR)
             # st.status en el CUERPO PRINCIPAL, no en la barra lateral: es el
@@ -1521,88 +1738,96 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
                 # muerta aunque el proceso siga vivo en el servidor y acabe
                 # guardando bien — exactamente el síntoma que reportó Juan:
                 # "recargué la página y los datos ya estaban". Cada intento
-                # manda ahora tráfico al websocket, evitando ese corte.
+                # manda ahora tráfico al websocket, y encima corre en un
+                # hilo aparte con su propio pulso de cadencia fija (ver
+                # _run_with_heartbeat) — doble red contra ese corte.
                 poll_line = st.empty()
 
                 def _poll_tick(i, n, fase):
                     verbo = "Pidiendo la referencia" if fase == "send" else "Esperando a IBKR"
                     poll_line.markdown(f"↻ {verbo} (intento {i}/{n})…")
 
-                try:
-                    status.write("Validando la query…")
-                    probe = client.fetch(on_progress=_poll_tick)
-                    poll_line.empty()
-                    v = validate_query(open(probe).read())
-                    if not v["ok"]:
-                        status.update(label="Query inválida", state="error")
-                        st.error(v["note"])
-                        return None
-                    status.write(f"Cuenta {', '.join(v['accounts'])} · query correcta")
+                def _backfill_body():
+                    try:
+                        status.write("Validando la query…")
+                        probe = client.fetch(on_progress=_poll_tick)
+                        poll_line.empty()
+                        v = validate_query(open(probe).read())
+                        if not v["ok"]:
+                            status.update(label="Query inválida", state="error")
+                            st.error(v["note"])
+                            signal["abort"] = True
+                            return
+                        status.write(f"Cuenta {', '.join(v['accounts'])} · query correcta")
 
-                    state = SyncState.load(state_path, qid)
-                    before_n = len(state.windows_done)
-                    drive = st.session_state.get("_drive_folder")
+                        state = SyncState.load(state_path, qid)
+                        before_n = len(state.windows_done)
+                        drive = st.session_state.get("_drive_folder")
 
-                    def _prog(i, n, fd, td):
-                        bar.progress(i / n)
-                        status.write(f"Descargando bloque {i}/{n}: {fd} → {td}")
+                        def _prog(i, n, fd, td):
+                            bar.progress(i / n)
+                            status.write(f"Descargando bloque {i}/{n}: {fd} → {td}")
 
-                    def _on_saved(s):
-                        # Sube el estado + el XML de la ventana recién
-                        # completada a Drive, UNA POR UNA (ver docstring de
-                        # q4_sync.backfill, on_saved) — así una interrupción a
-                        # media descarga (contenedor dormido/reiniciado) no
-                        # pierde lo ya conseguido: queda en Drive, no solo en
-                        # el scratch dir efímero de esta sesión.
-                        last_path = s.windows_done[-1][2]
-                        ST.sync_up(drive, RAW_DIR, os.path.basename(last_path),
-                                  os.path.basename(state_path))
+                        def _on_saved(s):
+                            # Sube el estado + el XML de la ventana recién
+                            # completada a Drive, UNA POR UNA (ver docstring de
+                            # q4_sync.backfill, on_saved) — así una interrupción a
+                            # media descarga (contenedor dormido/reiniciado) no
+                            # pierde lo ya conseguido: queda en Drive, no solo en
+                            # el scratch dir efímero de esta sesión.
+                            last_path = s.windows_done[-1][2]
+                            ST.sync_up(drive, RAW_DIR, os.path.basename(last_path),
+                                      os.path.basename(state_path))
 
-                    backfill(client, state, state_path, start.strftime("%Y%m%d"),
-                             on_progress=_prog, on_poll_progress=_poll_tick,
-                             on_saved=_on_saved)
-                    # El guardado FINAL de backfill() (state.last_run) queda
-                    # fuera del bucle, así que on_saved no lo cubre — un
-                    # último envío recoge ese último cambio.
-                    ST.sync_up(drive, RAW_DIR, os.path.basename(state_path))
-                    poll_line.empty()
-                    bar.progress(1.0)
-                    # Si no había ventanas pendientes (todo ya descargado de una
-                    # sincronización anterior), on_progress no se llama nunca y el
-                    # log se queda mudo entre "query correcta" y el final — eso es
-                    # justo lo que se leyó como "no pasa nada". Decirlo explícito.
-                    fetched = len(state.windows_done) - before_n
-                    status.write("Ya tenías todo el histórico pedido: nada nuevo "
-                                 "que descargar." if fetched == 0 else
-                                 f"Descarga completa: {fetched} bloque(s) nuevo(s).")
+                        backfill(client, state, state_path, start.strftime("%Y%m%d"),
+                                 on_progress=_prog, on_poll_progress=_poll_tick,
+                                 on_saved=_on_saved)
+                        # El guardado FINAL de backfill() (state.last_run) queda
+                        # fuera del bucle, así que on_saved no lo cubre — un
+                        # último envío recoge ese último cambio.
+                        ST.sync_up(drive, RAW_DIR, os.path.basename(state_path))
+                        poll_line.empty()
+                        bar.progress(1.0)
+                        # Si no había ventanas pendientes (todo ya descargado de una
+                        # sincronización anterior), on_progress no se llama nunca y el
+                        # log se queda mudo entre "query correcta" y el final — eso es
+                        # justo lo que se leyó como "no pasa nada". Decirlo explícito.
+                        fetched = len(state.windows_done) - before_n
+                        status.write("Ya tenías todo el histórico pedido: nada nuevo "
+                                     "que descargar." if fetched == 0 else
+                                     f"Descarga completa: {fetched} bloque(s) nuevo(s).")
 
-                    # `windows_done` es un histórico ACUMULADO (útil para el
-                    # incremental diario), pero lo que se carga en ESTA sesión
-                    # debe respetar lo pedido en "Histórico desde": sólo los
-                    # bloques cuyo cierre (td) cae en o después de esa fecha.
-                    cutoff = start.strftime("%Y%m%d")
-                    paths = tuple(_resolve_raw_path(w) for w in state.windows_done
-                                 if w[1] >= cutoff)
-                    status.write(f"Parseando {len(paths)} extractos…")
-                    st.session_state["paths"] = paths
-                    load_paths(paths)          # parsea aquí, con feedback visible
-                    _sync_up_parsed_cache(paths)
-                    # Sin `expanded=False`: si se colapsa solo, el único rastro de
-                    # que ha ido bien es la etiqueta de la caja — fácil de leer
-                    # como "no ha pasado nada" (fue justo lo que reportaron). Se
-                    # deja abierta y además una confirmación aparte que no se
-                    # colapsa con la caja.
-                    status.update(label="Sincronización completa", state="complete",
-                                  expanded=True)
-                    st.success(f"Listo: {fetched} bloque(s) nuevo(s) · "
-                              f"{len(paths)} extractos cargados en el panel.")
-                except Exception as e:
-                    status.update(label="Error en la sincronización", state="error",
-                                  expanded=True)
-                    st.error(str(e))
-                    return None
+                        # `windows_done` es un histórico ACUMULADO (útil para el
+                        # incremental diario), pero lo que se carga en ESTA sesión
+                        # debe respetar lo pedido en "Histórico desde": sólo los
+                        # bloques cuyo cierre (td) cae en o después de esa fecha.
+                        cutoff = start.strftime("%Y%m%d")
+                        paths = tuple(_resolve_raw_path(w) for w in state.windows_done
+                                     if w[1] >= cutoff)
+                        status.write(f"Parseando {len(paths)} extractos…")
+                        st.session_state["paths"] = paths
+                        load_paths(paths)          # parsea aquí, con feedback visible
+                        _sync_up_parsed_cache(paths)
+                        # Sin `expanded=False`: si se colapsa solo, el único rastro de
+                        # que ha ido bien es la etiqueta de la caja — fácil de leer
+                        # como "no ha pasado nada" (fue justo lo que reportaron). Se
+                        # deja abierta y además una confirmación aparte que no se
+                        # colapsa con la caja.
+                        status.update(label="Sincronización completa", state="complete",
+                                      expanded=True)
+                        st.success(f"Listo: {fetched} bloque(s) nuevo(s) · "
+                                  f"{len(paths)} extractos cargados en el panel.")
+                    except Exception as e:
+                        status.update(label="Error en la sincronización", state="error",
+                                      expanded=True)
+                        st.error(str(e))
+                        signal["abort"] = True
+
+                _run_with_heartbeat(_backfill_body)
         finally:
             _release_sync_lock(state_path)
+        if signal.get("abort"):
+            return None
     if st.session_state.get("paths"):
         ds = load_paths(st.session_state["paths"])
         _sync_up_parsed_cache(st.session_state["paths"])
@@ -2854,6 +3079,11 @@ def main():
         configuracion_view()
         st.stop()
 
+    # Fase 3 del plan de escalabilidad: adelanta la descarga de Yahoo a
+    # segundo plano en cuanto hay dataset, en vez de esperar a que el
+    # usuario abra la pestaña Benchmark (ver docstring de la función).
+    _prewarm_benchmarks_in_background(ds)
+
     # Quitados del sidebar a petición expresa: antes selectbox/number_input.
     # La moneda ya no es elegible — se fija sola a la moneda base de la
     # cuenta (ds.base_currency, de EquitySummaryInBase/StmtFunds, §1). 0 %
@@ -2893,7 +3123,10 @@ def main():
         # formas de cartera que el motor aún no valida antes de mostrar números mal.
         # _cached_selfcheck() ya se calcula una vez por histórico, no en cada rerun
         # (ver su docstring — el guard basado en id(ds) que había aquí no funcionaba).
-        sc_issues = _cached_selfcheck(_RawPaths(st.session_state["paths"]))
+        # _selfcheck_with_drive_cache() añade un artefacto persistido en Drive
+        # por encima (Fase 4 del plan de escalabilidad): sólo importa en un
+        # proceso frío, ver su docstring.
+        sc_issues = _selfcheck_with_drive_cache(st.session_state["paths"])
         for issue in sc_issues:
             (st.error if issue["level"] == "error" else st.warning)(issue["msg"])
         if not sc_issues:

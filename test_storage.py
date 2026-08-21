@@ -71,7 +71,10 @@ def test_init_session_storage_hydrates_from_drive():
 def test_init_session_storage_migrates_loose_files_from_root():
     """Instalación de ANTES de que existieran las subcarpetas: XML/JSON
     sueltos en la raíz. Deben acabar en Drive dentro de XML/JSON (no en la
-    raíz) y, en local, seguir apareciendo igual que siempre (plano)."""
+    raíz). En local, el `.parsed.json` migrado ya cubre el análisis (ver
+    `parse_file_cached`), así que el `.xml` NO hace falta bajarlo — mismo
+    comportamiento que test_init_session_storage_skips_xml_when_parsed_json_
+    already_covers_it, aquí sólo se comprueba que la migración no lo cambia."""
     drive = FakeDriveFolder()
     drive.files["a.xml"] = b"<xml/>"
     drive.files["a.xml.parsed.json"] = b"{}"
@@ -79,13 +82,44 @@ def test_init_session_storage_migrates_loose_files_from_root():
 
     local = ST.init_session_storage(drive)
 
-    assert set(os.listdir(local)) == {"a.xml", "a.xml.parsed.json", "state_Q1.json"}
+    assert set(os.listdir(local)) == {"a.xml.parsed.json", "state_Q1.json"}
     # migrado de verdad en Drive, no sólo "también visible" en local:
     assert "a.xml" not in drive.files
     assert "a.xml.parsed.json" not in drive.files
     assert "state_Q1.json" in drive.files              # esto SÍ es de la raíz, no se toca
     assert drive.subfolder("XML").files == {"a.xml": b"<xml/>"}
     assert drive.subfolder("JSON").files == {"a.xml.parsed.json": b"{}"}
+
+
+def test_init_session_storage_skips_xml_when_parsed_json_already_covers_it():
+    """El caso normal: histórico ya parseado en una sesión anterior. No hace
+    falta bajar el XML crudo -- basta con el `.parsed.json` para que
+    `parse_file_cached()` no vuelva a tocar el XML (ver su docstring)."""
+    drive = FakeDriveFolder()
+    drive.subfolder("XML").files["a.xml"] = b"<xml/>"
+    drive.subfolder("JSON").files["a.xml.parsed.json"] = b'{"nav": {}}'
+    local = ST.init_session_storage(drive)
+    assert set(os.listdir(local)) == {"a.xml.parsed.json"}
+
+
+def test_init_session_storage_downloads_xml_when_parsed_json_is_corrupt():
+    """Si el `.parsed.json` hidratado resulta corrupto, SÍ se baja el XML
+    correspondiente -- así `parse_file_cached()` puede reparsear en vez de
+    reventar por falta del crudo."""
+    drive = FakeDriveFolder()
+    drive.subfolder("XML").files["a.xml"] = b"<xml/>"
+    drive.subfolder("JSON").files["a.xml.parsed.json"] = b"{not valid json"
+    local = ST.init_session_storage(drive)
+    assert set(os.listdir(local)) == {"a.xml.parsed.json", "a.xml"}
+
+
+def test_init_session_storage_downloads_xml_without_matching_parsed_json():
+    """Un XML sin su `.parsed.json` (aún no parseado, o borrado) se sigue
+    bajando siempre -- nada que pueda saltarse."""
+    drive = FakeDriveFolder()
+    drive.subfolder("XML").files["b.xml"] = b"<xml/>"
+    local = ST.init_session_storage(drive)
+    assert set(os.listdir(local)) == {"b.xml"}
 
 
 def test_init_session_storage_migration_is_idempotent():

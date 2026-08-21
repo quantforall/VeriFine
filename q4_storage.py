@@ -41,11 +41,14 @@ funcionando exactamente igual que antes de que existiera esta capa.
 from __future__ import annotations
 
 import os
+import json
 import logging
 import mimetypes
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import q4_probe as PR
 from q4_drive import AuthError, DriveError, DriveFolder
 
 log = logging.getLogger("q4.storage")
@@ -57,8 +60,20 @@ log = logging.getLogger("q4.storage")
 # app (varios segundos de solo esperar red antes de ver nada).
 MAX_PARALLEL_DOWNLOADS = 8
 
+# Techo de descargas Drive concurrentes por PROCESO, no sólo por sesión.
+# MAX_PARALLEL_DOWNLOADS de arriba acota los hilos de UNA sesión, pero
+# Streamlit Cloud no da un proceso por usuario — con muchas sesiones
+# hidratando a la vez esos límites se SUMAN: 300 sesiones × 8 hilos serían
+# hasta 2.400 descargas Drive simultáneas contra la cuota del mismo proyecto
+# OAuth. Este semáforo es el techo real, compartido por todas las sesiones
+# del proceso; 40 es un punto de partida conservador — Fase 0 (q4_probe) da
+# los datos para ajustarlo con conocimiento real, no a ciegas.
+GLOBAL_MAX_PARALLEL_DOWNLOADS = 40
+_download_semaphore = threading.Semaphore(GLOBAL_MAX_PARALLEL_DOWNLOADS)
+
 XML_SUBDIR = "XML"
 JSON_SUBDIR = "JSON"
+_PARSED_SUFFIX = ".parsed.json"
 
 
 def _target_subdir(name: str) -> str | None:
@@ -71,12 +86,6 @@ def _target_subdir(name: str) -> str | None:
     if name.endswith(".xml"):
         return XML_SUBDIR
     return None
-
-
-def _folder_for(drive: DriveFolder, name: str) -> DriveFolder:
-    """La carpeta de Drive (raíz o subcarpeta) donde vive `name`."""
-    sub = _target_subdir(name)
-    return drive.subfolder(sub) if sub else drive
 
 
 def _migrate_loose_files_to_subfolders(drive: DriveFolder) -> None:
@@ -100,18 +109,29 @@ def _migrate_loose_files_to_subfolders(drive: DriveFolder) -> None:
         drive.delete(name)
 
 
-def _hydrate_folder(folder: DriveFolder, local_dir: str) -> int:
-    """Descarga TODO lo que haya en `folder` (una carpeta o subcarpeta de
-    Drive) a `local_dir`, en paralelo. Devuelve cuántos ficheros se
-    escribieron. Un fichero que desaparezca a mitad se omite (no aborta la
-    sesión); un token inválido (`AuthError`) sí se propaga — afecta a TODA
-    la hidratación, no a un fichero suelto."""
-    files = folder.list_files()
+def _hydrate_folder(folder: DriveFolder, local_dir: str, files: dict[str, dict],
+                    skip: frozenset[str] = frozenset()) -> int:
+    """Descarga en paralelo los ficheros de `files` (ya listados por quien
+    llama, ver `folder.list_files()` — así una lista se puede reutilizar
+    para decidir qué saltar sin pedirla dos veces) a `local_dir`. `skip`:
+    nombres que no hace falta bajar (ver `init_session_storage`, que salta
+    el XML cuyo `.parsed.json` ya se hidrató y es válido). Devuelve cuántos
+    ficheros se escribieron.
+
+    Cada descarga pasa por `_download_semaphore` — acota cuántas de estas
+    llamadas están en vuelo A LA VEZ EN TODO EL PROCESO, no sólo dentro de
+    este `ThreadPoolExecutor` (ver su definición más arriba).
+
+    Un fichero que desaparezca a mitad se omite (no aborta la sesión); un
+    token inválido (`AuthError`) sí se propaga — afecta a TODA la
+    hidratación, no a un fichero suelto."""
+    targets = {name: info for name, info in files.items() if name not in skip}
     written = 0
 
     def _fetch(name: str, file_id: str) -> tuple[str, bytes | None]:
         try:
-            return name, folder.download_by_id(file_id)
+            with _download_semaphore:
+                return name, folder.download_by_id(file_id)
         except AuthError:
             raise
         except DriveError:
@@ -119,8 +139,8 @@ def _hydrate_folder(folder: DriveFolder, local_dir: str) -> int:
                        name, exc_info=True)
             return name, None
 
-    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_DOWNLOADS, len(files)) or 1) as pool:
-        futures = [pool.submit(_fetch, name, info["id"]) for name, info in files.items()]
+    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_DOWNLOADS, len(targets)) or 1) as pool:
+        futures = [pool.submit(_fetch, name, info["id"]) for name, info in targets.items()]
         for fut in as_completed(futures):
             name, content = fut.result()
             if content is None:
@@ -131,20 +151,64 @@ def _hydrate_folder(folder: DriveFolder, local_dir: str) -> int:
     return written
 
 
-def init_session_storage(drive: DriveFolder | None) -> str:
+def _already_parsed_names(json_files: dict[str, dict], local_dir: str) -> frozenset[str]:
+    """Nombres de XML cuyo `.parsed.json` ya se hidrató en `local_dir` Y es
+    JSON válido — esos XML no hace falta bajarlos (ver `init_session_storage`
+    e `q4_parser.parse_file_cached`, que nunca vuelve a abrir el crudo si su
+    caché ya existe). Se valida el contenido, no sólo que el nombre aparezca
+    en el listado: si la caché resultara corrupta, el XML SÍ se baja (ver
+    `test_init_session_storage_downloads_xml_when_parsed_json_is_corrupt`),
+    para que `parse_file_cached` pueda reparsear en vez de reventar por
+    falta del crudo."""
+    out = set()
+    for name in json_files:
+        if not name.endswith(_PARSED_SUFFIX):
+            continue
+        local_path = os.path.join(local_dir, name)
+        if not os.path.exists(local_path):
+            continue  # no se pudo bajar (ver _hydrate_folder): nada que optimizar
+        try:
+            with open(local_path, encoding="utf-8") as fh:
+                json.load(fh)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        out.add(name[: -len(_PARSED_SUFFIX)])
+    return frozenset(out)
+
+
+def init_session_storage(drive: DriveFolder | None, session_id: str | None = None) -> str:
     """Directorio local para ESTA sesión, hidratado desde Drive si aplica.
 
     El directorio local queda PLANO (XML y JSON mezclados, como siempre) —
     la separación en subcarpetas es sólo del lado de Drive; ver cabecera
-    del fichero. Devuelve la ruta a usar como `RAW_DIR` de la sesión."""
+    del fichero. Devuelve la ruta a usar como `RAW_DIR` de la sesión.
+
+    `session_id` es puramente para correlacionar la métrica de duración
+    (ver q4_probe.timed) entre sesiones en los logs — no cambia nada del
+    comportamiento si se omite."""
     local_dir = tempfile.mkdtemp(prefix="verifine_")
     if drive is None:
         return local_dir
-    _migrate_loose_files_to_subfolders(drive)
-    written = _hydrate_folder(drive, local_dir)
-    written += _hydrate_folder(drive.subfolder(XML_SUBDIR), local_dir)
-    written += _hydrate_folder(drive.subfolder(JSON_SUBDIR), local_dir)
-    log.info("Sesión hidratada desde Drive: %d fichero(s)", written)
+    with PR.timed("hydrate_session", session_id=session_id or "-"):
+        _migrate_loose_files_to_subfolders(drive)
+
+        written = _hydrate_folder(drive, local_dir, drive.list_files())
+
+        json_folder = drive.subfolder(JSON_SUBDIR)
+        json_files = json_folder.list_files()
+        written += _hydrate_folder(json_folder, local_dir, json_files)
+
+        # El XML es inmutable (q4_ingest.FlexClient.fetch) — si su
+        # .parsed.json ya está aquí y es válido, bajarlo también sólo
+        # alarga la hidratación sin que nada lo use (ver
+        # _already_parsed_names).
+        already_parsed = _already_parsed_names(json_files, local_dir)
+        xml_folder = drive.subfolder(XML_SUBDIR)
+        written += _hydrate_folder(xml_folder, local_dir, xml_folder.list_files(),
+                                   skip=already_parsed)
+
+        log.info("Sesión hidratada desde Drive: %d fichero(s) (%d XML omitidos, "
+                 "ya parseados)", written, len(already_parsed))
     return local_dir
 
 
@@ -153,26 +217,45 @@ def sync_up(drive: DriveFolder | None, raw_dir: str, *basenames: str) -> None:
     que le corresponda por sufijo — XML/, JSON/ o la raíz (ver
     `_target_subdir`). No-op si `drive is None`. Un nombre que ya no exista
     localmente se salta sin más — no es un error, sólo algo que no había o
-    que se decidió no persistir."""
+    que se decidió no persistir.
+
+    Agrupado por carpeta destino antes de subir nada: `DriveFolder.upload()`
+    ya evita resubir sin cambios con su propio `list_files()` interno, pero
+    llamado UNA VEZ POR FICHERO, subir N ficheros nuevos a la misma carpeta
+    (p. ej. un backfill grande) costaba N listados completos en vez de que
+    los ficheros de la misma tanda compartan lo que ya se sabe de esa
+    carpeta."""
     if drive is None:
         return
-    for name in basenames:
-        path = os.path.join(raw_dir, name)
-        if not os.path.exists(path):
-            continue
-        with open(path, "rb") as fh:
-            content = fh.read()
-        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
-        _folder_for(drive, name).upload(name, content, mime)
+    for sub, names in _group_by_subdir(basenames).items():
+        folder = drive.subfolder(sub) if sub else drive
+        for name in names:
+            path = os.path.join(raw_dir, name)
+            if not os.path.exists(path):
+                continue
+            with open(path, "rb") as fh:
+                content = fh.read()
+            mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+            folder.upload(name, content, mime)
 
 
 def sync_delete(drive: DriveFolder | None, *basenames: str) -> None:
     """Borra `basenames` de su carpeta Drive correspondiente. No-op si
-    `drive is None`."""
+    `drive is None`. Agrupado por carpeta destino — mismo motivo que
+    `sync_up`."""
     if drive is None:
         return
+    for sub, names in _group_by_subdir(basenames).items():
+        folder = drive.subfolder(sub) if sub else drive
+        for name in names:
+            folder.delete(name)
+
+
+def _group_by_subdir(basenames: tuple[str, ...]) -> dict[str | None, list[str]]:
+    out: dict[str | None, list[str]] = {}
     for name in basenames:
-        _folder_for(drive, name).delete(name)
+        out.setdefault(_target_subdir(name), []).append(name)
+    return out
 
 
 def wipe_drive_folder(drive: DriveFolder | None) -> None:

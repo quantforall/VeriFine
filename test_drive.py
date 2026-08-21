@@ -421,3 +421,109 @@ def test_release_lock_allows_immediate_reacquire():
     folder.acquire_lock("state_123.json.lock")
     folder.release_lock("state_123.json.lock")
     assert folder.acquire_lock("state_123.json.lock") is True
+
+
+# --------------------------------------------------------------------------
+# Caché en memoria de subfolder()/upload()/delete() (Fase 1 del plan de
+# escalabilidad: menos I/O redundante contra la API de Drive)
+# --------------------------------------------------------------------------
+
+def test_subfolder_id_is_cached_no_repeat_lookup():
+    session = FakeDriveSession()
+    root = make_folder(session)
+    root.subfolder("XML")
+    calls_before = len(session.calls)
+    root.subfolder("XML")
+    assert len(session.calls) == calls_before   # segunda vez: nada nuevo contra Drive
+
+
+def test_upload_reuses_cached_listing_across_calls():
+    session = FakeDriveSession()
+    folder = make_folder(session)
+    folder.upload("a.xml", b"A")
+    calls_before = len(session.calls)
+    folder.upload("b.xml", b"B")
+    # sin caché esto habría hecho OTRO list_files() (un GET) antes de crear
+    # -- con la caché ya poblada por la subida anterior, sólo el POST.
+    assert len(session.calls) - calls_before == 1
+
+
+def test_delete_reuses_cached_listing():
+    session = FakeDriveSession()
+    folder = make_folder(session)
+    folder.upload("a.xml", b"A")
+    calls_before = len(session.calls)
+    folder.delete("a.xml")
+    # sin caché: list_files() + DELETE = 2. Con caché: sólo el DELETE.
+    assert len(session.calls) - calls_before == 1
+    assert "a.xml" not in folder.list_files()
+
+
+def test_delete_of_unknown_name_does_not_call_drive():
+    folder = make_folder()
+    folder.upload("a.xml", b"A")   # puebla la caché de esta carpeta
+    session = folder.session
+    calls_before = len(session.calls)
+    folder.delete("nope.xml")      # no está ni en Drive ni en la caché
+    assert len(session.calls) == calls_before
+
+
+# --------------------------------------------------------------------------
+# Reintento con backoff en 429/5xx (Fase 1) — nunca en el resto de 4xx
+# --------------------------------------------------------------------------
+
+class FlakyRateLimitSession:
+    """Envuelve una `FakeDriveSession`: las primeras `fail_times` llamadas
+    devuelven `status`; luego delega en la sesión real."""
+
+    def __init__(self, inner, fail_times: int = 1, status: int = 429):
+        self.inner = inner
+        self.fail_times = fail_times
+        self.status = status
+        self.attempts = 0
+
+    def request(self, method, url, **kwargs):
+        self.attempts += 1
+        if self.attempts <= self.fail_times:
+            return FakeResp(self.status, {"error": "rate_limited"})
+        return self.inner.request(method, url, **kwargs)
+
+
+class AlwaysFailsSession:
+    def __init__(self, status: int):
+        self.status = status
+        self.calls = 0
+
+    def request(self, method, url, **kwargs):
+        self.calls += 1
+        return FakeResp(self.status, {"error": "boom"})
+
+
+def test_request_retries_on_429_then_succeeds(monkeypatch):
+    monkeypatch.setattr(D.time, "sleep", lambda *a, **k: None)   # sin esperas reales en tests
+    flaky = FlakyRateLimitSession(FakeDriveSession(), fail_times=2, status=429)
+    folder = make_folder(flaky)          # resolve_or_create ya pasa por _request
+    assert folder.folder_id
+
+
+def test_request_retries_on_5xx_then_succeeds(monkeypatch):
+    monkeypatch.setattr(D.time, "sleep", lambda *a, **k: None)
+    flaky = FlakyRateLimitSession(FakeDriveSession(), fail_times=1, status=503)
+    folder = make_folder(flaky)
+    assert folder.folder_id
+
+
+def test_request_gives_up_after_max_attempts(monkeypatch):
+    monkeypatch.setattr(D.time, "sleep", lambda *a, **k: None)
+    flaky = FlakyRateLimitSession(FakeDriveSession(), fail_times=99, status=429)
+    with pytest.raises(D.DriveError):
+        make_folder(flaky)
+    assert flaky.attempts == D.RETRY_ATTEMPTS   # ni uno más
+
+
+def test_request_does_not_retry_plain_4xx(monkeypatch):
+    monkeypatch.setattr(D.time, "sleep", lambda *a, **k: None)
+    always_404 = AlwaysFailsSession(404)
+    with pytest.raises(D.DriveError):
+        make_folder(always_404)
+    assert always_404.calls == 1   # un 404 no es cuota ni caída de Google: sin reintento

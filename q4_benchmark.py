@@ -25,6 +25,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+import q4_probe as PR
+
 CACHE_DIR = os.environ.get("Q4_CACHE", "./cache_benchmark")
 
 # --------------------------------------------------------------------------
@@ -80,14 +82,19 @@ def fetch_benchmark(ticker: str, start: str, end: str, force: bool = False) -> p
     d0 = dt.datetime.strptime(start, "%Y%m%d") - dt.timedelta(days=7)
     d1 = dt.datetime.strptime(end, "%Y%m%d") + dt.timedelta(days=2)
 
-    df = yf.download(
-        ticker,
-        start=d0.strftime("%Y-%m-%d"),
-        end=d1.strftime("%Y-%m-%d"),
-        auto_adjust=True,      # <-- CRÍTICO: retorno total, no índice de precios (§19.1)
-        progress=False,
-        actions=False,
-    )
+    # Sólo esta parte va a red -- separada de la lectura de caché de arriba
+    # a propósito, para que la métrica (Fase 0 del plan de escalabilidad)
+    # mida el coste real de un miss, sin diluirlo con los hits (casi
+    # gratis) en el mismo agregado.
+    with PR.timed("fetch_benchmark_network", ticker=ticker):
+        df = yf.download(
+            ticker,
+            start=d0.strftime("%Y-%m-%d"),
+            end=d1.strftime("%Y-%m-%d"),
+            auto_adjust=True,      # <-- CRÍTICO: retorno total, no índice de precios (§19.1)
+            progress=False,
+            actions=False,
+        )
     if df is None or df.empty:
         raise RuntimeError(f"Yahoo no devolvió datos para {ticker}")
 

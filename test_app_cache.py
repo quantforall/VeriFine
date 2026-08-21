@@ -21,6 +21,9 @@ colisión que el propio mecanismo está pensado para evitar en producción."""
 from __future__ import annotations
 
 import os
+import json
+import time
+import hashlib
 
 import pytest
 
@@ -251,9 +254,143 @@ def test_cached_portfolio_survives_different_session_directories(tmp_path, monke
     assert len(calls) == 1
 
 
+class FakeSelfcheckDrive:
+    """Doble mínimo de DriveFolder — sólo lo que usa
+    _selfcheck_with_drive_cache (download/upload)."""
+
+    def __init__(self):
+        self.files: dict[str, bytes] = {}
+
+    def download(self, name):
+        return self.files.get(name)
+
+    def upload(self, name, content, mime_type="application/octet-stream"):
+        self.files[name] = content
+        return name
+
+
+def test_selfcheck_with_drive_cache_returns_persisted_artifact_without_recomputing(
+        tmp_path, monkeypatch):
+    """Fase 4 del plan de escalabilidad: si el artefacto de Drive coincide
+    con la huella del histórico actual, ni siquiera se llama a
+    SC.run_checks() -- el punto entero es saltarse ese cálculo en un
+    proceso frío."""
+    calls = []
+    monkeypatch.setattr(app.SC, "run_checks", lambda *a, **k: calls.append(1) or [])
+    d1 = tmp_path / "s1"
+    d1.mkdir()
+    paths = (_write(d1, "case_drive_cache_hit.xml"),)
+    fingerprint = app._stable_cache_key(paths)
+
+    drive = FakeSelfcheckDrive()
+    drive.files[app._SELFCHECK_ARTIFACT_NAME] = json.dumps(
+        {"fingerprint": fingerprint, "issues": [{"level": "warning", "msg": "desde Drive"}]}
+    ).encode("utf-8")
+    app.st.session_state["_drive_folder"] = drive
+    try:
+        issues = app._selfcheck_with_drive_cache(paths)
+    finally:
+        app.st.session_state.pop("_drive_folder", None)
+
+    assert issues == [{"level": "warning", "msg": "desde Drive"}]
+    assert calls == []
+
+
+def test_selfcheck_with_drive_cache_falls_back_and_persists_on_mismatch(tmp_path, monkeypatch):
+    """Huella distinta (histórico distinto, o artefacto de otra sesión
+    vieja) -- se recalcula de verdad y el resultado NUEVO se sube a Drive
+    en segundo plano para la próxima vez."""
+    monkeypatch.setattr(app.SC, "run_checks", lambda *a, **k: [])
+    d1 = tmp_path / "s1"
+    d1.mkdir()
+    paths = (_write(d1, "case_drive_cache_miss.xml"),)
+    fingerprint = app._stable_cache_key(paths)
+
+    drive = FakeSelfcheckDrive()
+    drive.files[app._SELFCHECK_ARTIFACT_NAME] = json.dumps(
+        {"fingerprint": "huella-de-otro-histórico",
+         "issues": [{"level": "error", "msg": "no debería verse"}]}
+    ).encode("utf-8")
+    app.st.session_state["_drive_folder"] = drive
+    try:
+        issues = app._selfcheck_with_drive_cache(paths)
+        # el hilo de persistencia es un daemon en background -- darle un
+        # instante para que escriba antes de comprobar (con tope, no un
+        # sleep fijo, para no ser más lento de lo necesario en CI).
+        for _ in range(200):
+            saved_raw = drive.files.get(app._SELFCHECK_ARTIFACT_NAME)
+            if saved_raw and json.loads(saved_raw)["fingerprint"] == fingerprint:
+                break
+            time.sleep(0.01)
+    finally:
+        app.st.session_state.pop("_drive_folder", None)
+
+    assert issues == []   # el resultado RECALCULADO (mock), no el del artefacto viejo
+    saved = json.loads(drive.files[app._SELFCHECK_ARTIFACT_NAME])
+    assert saved["fingerprint"] == fingerprint
+    assert saved["issues"] == []
+
+
+def test_selfcheck_with_drive_cache_works_without_drive(tmp_path, monkeypatch):
+    """Q4_STORAGE_BACKEND=local (sin Drive conectado): cae directo en
+    _cached_selfcheck(), sin intentar leer ni escribir ningún artefacto."""
+    monkeypatch.setattr(app.SC, "run_checks", lambda *a, **k: [])
+    d1 = tmp_path / "s1"
+    d1.mkdir()
+    paths = (_write(d1, "case_drive_cache_no_drive.xml"),)
+    app.st.session_state.pop("_drive_folder", None)
+    assert app._selfcheck_with_drive_cache(paths) == []
+
+
 def test_stable_cache_key_preserves_order_not_sorted():
     key_forward = app._stable_cache_key(("/x/b.xml", "/y/a.xml"))
     key_backward = app._stable_cache_key(("/x/a.xml", "/y/b.xml"))
     assert key_forward == "b.xml\x00a.xml"
     assert key_backward == "a.xml\x00b.xml"
     assert key_forward != key_backward
+
+
+def _flex_filename(query_id: str, xml: str, tag: str = "default",
+                   stamp: str = "20260101T000000Z") -> str:
+    """Reproduce el esquema de nombre REAL de q4_ingest.FlexClient.fetch():
+    `{query_id}_{tag}_{stamp}_{sha256(contenido)[:12]}.xml`. No importa
+    q4_ingest aquí a propósito -- este test no quiere una llamada de red,
+    sólo verificar el INVARIANTE del que depende _stable_cache_key (ver su
+    docstring): si esta fórmula cambiara alguna vez en q4_ingest.py sin
+    tocar aquí, el test seguiría siendo válido como documentación de lo que
+    _stable_cache_key ASUME, aunque dejara de reflejar el código real -- por
+    eso conviene revisar este test si `FlexClient.fetch()` cambia de
+    esquema."""
+    digest = hashlib.sha256(xml.encode()).hexdigest()[:12]
+    return f"{query_id}_{tag}_{stamp}_{digest}.xml"
+
+
+def test_stable_cache_key_does_not_collide_across_different_content(tmp_path, _spy_on_parse):
+    """Invariante de aislamiento de la Fase 0 del plan de escalabilidad: dos
+    'usuarios' que compartieran el MISMO query_id de IBKR (el peor caso: en
+    producción el query_id ya es una credencial privada por cuenta, así que
+    esto ni siquiera debería pasar) pero con historiales DISTINTOS nunca
+    comparten entrada de caché, porque el nombre de fichero real incluye un
+    hash del contenido (ver `_flex_filename` / `q4_ingest.FlexClient.fetch`).
+    Sin este hash, el P0 que señalaba el diagnóstico externo (dos usuarios
+    con nombre de fichero igual reutilizando el resultado del otro) sí sería
+    un riesgo real -- con él, no lo es."""
+    same_qid = "Q999"
+    xml_user_a = _mini_xml_dates(1000.0, 1010.0)
+    xml_user_b = _mini_xml_dates(5000.0, 4000.0)   # historial totalmente distinto
+
+    name_a = _flex_filename(same_qid, xml_user_a)
+    name_b = _flex_filename(same_qid, xml_user_b)
+    assert name_a != name_b   # el hash de contenido ya los separa
+
+    da, db = tmp_path / "user_a", tmp_path / "user_b"
+    da.mkdir()
+    db.mkdir()
+    pa = (_write(da, name_a, xml_user_a),)
+    pb = (_write(db, name_b, xml_user_b),)
+
+    ds_a = app.load_paths(pa)
+    ds_b = app.load_paths(pb)
+    assert len(_spy_on_parse) == 2   # dos entradas de caché distintas, ninguna reutilizada
+    # y de verdad son datos distintos, no sólo "no se compartió la llamada"
+    assert set(ds_a.nav["total"]) != set(ds_b.nav["total"])
