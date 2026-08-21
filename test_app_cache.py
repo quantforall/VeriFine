@@ -73,9 +73,9 @@ def _spy_on_parse(monkeypatch):
     calls = []
     orig = app.P.load
 
-    def spy(paths):
+    def spy(paths, **kwargs):
         calls.append(tuple(paths))
-        return orig(paths)
+        return orig(paths, **kwargs)
 
     monkeypatch.setattr(app.P, "load", spy)
     return calls

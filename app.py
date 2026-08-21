@@ -886,7 +886,7 @@ _CACHE_TTL_BENCH = "6h"
 @st.cache_data(show_spinner="Parseando extractos…",
                hash_funcs={tuple: _stable_cache_key},
                max_entries=_CACHE_MAX_DATASETS, ttl=_CACHE_TTL)
-def load_paths(paths: tuple[str, ...]) -> P.Dataset:
+def load_paths(paths: tuple[str, ...], _on_progress=None) -> P.Dataset:
     """Cachea por NOMBRE de fichero, no por ruta completa — `paths` trae el
     RAW_DIR de la sesión (un `tempfile.mkdtemp()` distinto cada vez, ver
     `q4_storage.init_session_storage`), así que con la ruta completa como
@@ -895,9 +895,16 @@ def load_paths(paths: tuple[str, ...]) -> P.Dataset:
     cada una repetía el `P.load()` completo (merge/dedup/bootstrap) aunque
     fuera exactamente el mismo histórico de siempre. El nombre de fichero sí
     es estable entre sesiones porque el XML crudo es inmutable por diseño
-    (mismo argumento que `q4_parser.parse_file_cached`)."""
+    (mismo argumento que `q4_parser.parse_file_cached`).
+
+    `_on_progress` — con el guión bajo a propósito: `st.cache_data` excluye
+    de la clave de caché cualquier parámetro que empiece por `_` (no lo
+    hashea, ni falla si no es hasheable — una función no lo es). Así se
+    puede pasar un callback de progreso sin invalidar ni fragmentar la
+    caché entre llamadas que sólo difieren en quién quiere feedback visual
+    ahora mismo (ver el uso en sidebar_source(), justo tras el backfill)."""
     with PR.timed("load_paths", n_files=len(paths)):
-        return P.load(list(paths))
+        return P.load(list(paths), on_progress=_on_progress)
 
 
 def _sync_up_parsed_cache(paths: tuple[str, ...]) -> None:
@@ -1826,7 +1833,22 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
                                      if w[1] >= cutoff)
                         status.write(f"Parseando {len(paths)} extractos…")
                         st.session_state["paths"] = paths
-                        load_paths(paths)          # parsea aquí, con feedback visible
+
+                        # Progreso POR FICHERO, no un mensaje estático seguido
+                        # de un load_paths() bloqueante — con un histórico
+                        # grande recién descargado (nada en caché todavía,
+                        # ver q4_parser.parse_file_cached), parsear puede
+                        # tardar y antes no había ninguna señal de avance
+                        # hasta que TODO terminaba. Reutiliza bar/poll_line,
+                        # ya libres tras las fases de arriba (validar query +
+                        # descargar bloques).
+                        def _parse_tick(i, n, name):
+                            bar.progress(i / n if n else 1.0)
+                            poll_line.markdown(f"↻ Parseando {i}/{n}: {name}")
+
+                        load_paths(paths, _on_progress=_parse_tick)
+                        poll_line.empty()
+                        bar.progress(1.0)
                         _sync_up_parsed_cache(paths)
                         # Sin `expanded=False`: si se colapsa solo, el único rastro de
                         # que ha ido bien es la etiqueta de la caja — fácil de leer
@@ -2932,8 +2954,8 @@ def _clickable_logo(filename: str, href: str, alt: str, title: str, subtitle: st
     components.html(f"""
         <style>
           html, body {{ margin:0; padding:0; background:transparent; }}
-          a {{ display:flex; align-items:center; gap:14px; border-radius:8px;
-            padding:12px 14px; border:1px solid {BORDER}; background:{CARD};
+          a {{ display:flex; align-items:center; gap:16px; border-radius:8px;
+            padding:14px 20px; border:1px solid {BORDER}; background:{CARD};
             text-decoration:none; box-sizing:border-box; height:100%;
             transition:border-color .15s ease, transform .15s ease;
             font-family:'Fira Sans',Helvetica,Arial,sans-serif; }}
@@ -3195,14 +3217,19 @@ def main():
     # riesgo, así que ese cálculo no cambia para nadie.
     currency = ds.base_currency
     rf = 0.0
-    accounts = st.sidebar.multiselect("Cuentas", ds.accounts, default=ds.accounts)
-    if license_mode == "free" and set(accounts) != set(ds.accounts):
-        # Licencia gratuita: la selección de cuentas no aplica al cálculo —
-        # se ve, se puede tocar, pero siempre se analiza con todas (ver
-        # también el selector de periodo, más abajo, mismo mecanismo).
-        st.sidebar.warning("Cambiar las cuentas requiere licencia completa — "
-                          "se sigue mostrando con todas.")
-        accounts = ds.accounts
+    # Licencia gratuita: el multiselect queda DESHABILITADO (no sólo
+    # ignorado tras tocarlo) — a petición expresa, para que ni siquiera
+    # dispare un rerun al intentar tocarlo (con `disabled=True` el
+    # navegador no deja interactuar, así que no hay on_change ni recálculo
+    # de por medio — antes, aunque el resultado se ignorara, cada intento
+    # de cambio SÍ disparaba un rerun completo de Streamlit, y eso es lo
+    # que se notaba como "se pone a calcular"). Con `default=ds.accounts`
+    # y deshabilitado, el valor devuelto es siempre la lista completa.
+    accounts_locked = license_mode == "free"
+    accounts = st.sidebar.multiselect(
+        "Cuentas", ds.accounts, default=ds.accounts, disabled=accounts_locked,
+        help="Requiere licencia completa — con la gratuita se analiza siempre "
+            "con todas las cuentas." if accounts_locked else None)
 
     # Benchmark: se elige AQUÍ, al principio, y de ahí en adelante aparece
     # como comparativa en Evolución, Riesgo, la tabla por año y las ventanas
@@ -3303,22 +3330,25 @@ def main():
             st.session_state.sld = (a, b)
             st.session_state.din_from, st.session_state.din_to = a, b
 
+        # Licencia gratuita: los tres widgets quedan DESHABILITADOS, no sólo
+        # ignorados tras tocarlos — mismo motivo que el multiselect de
+        # cuentas, más arriba (con `disabled=True` no hay on_change ni
+        # rerun al intentar moverlos, así que no hay ni sensación de que
+        # "se pone a calcular"). session_state.sld ya está fijado al rango
+        # completo por el reset de arriba, así que deshabilitado siempre
+        # muestra ese rango, nunca uno parcial.
+        period_locked = license_mode == "free"
+        period_help = ("Requiere licencia completa — con la gratuita se analiza "
+                       "siempre el rango completo." if period_locked else None)
         st.sidebar.slider("Periodo de análisis", min_value=lo_d, max_value=hi_d,
-                          key="sld", on_change=_from_slider, format="DD/MM/YYYY")
+                          key="sld", on_change=_from_slider, format="DD/MM/YYYY",
+                          disabled=period_locked, help=period_help)
         cA, cB = st.sidebar.columns(2)
         cA.date_input("Desde", min_value=lo_d, max_value=hi_d, key="din_from",
-                      on_change=_from_inputs, format="DD/MM/YYYY")
+                      on_change=_from_inputs, format="DD/MM/YYYY", disabled=period_locked)
         cB.date_input("Hasta", min_value=lo_d, max_value=hi_d, key="din_to",
-                      on_change=_from_inputs, format="DD/MM/YYYY")
+                      on_change=_from_inputs, format="DD/MM/YYYY", disabled=period_locked)
         lo_sel, hi_sel = st.session_state.sld
-        if license_mode == "free" and (lo_sel, hi_sel) != (lo_d, hi_d):
-            # Licencia gratuita: el slider/date_input se ven y se pueden
-            # mover con normalidad, pero el cálculo ignora el cambio y usa
-            # siempre el rango completo permitido — mismo mecanismo que el
-            # multiselect de cuentas, más arriba.
-            st.sidebar.warning("Cambiar el periodo requiere licencia completa — "
-                              "se sigue mostrando el rango completo.")
-            lo_sel, hi_sel = lo_d, hi_d
         lo_s, hi_s = lo_sel.strftime("%Y%m%d"), hi_sel.strftime("%Y%m%d")
         dates = [d for d in funded if lo_s <= d <= hi_s]
     else:

@@ -381,20 +381,30 @@ def parse_file_cached(path: str) -> dict:
 # Consolidación de varios ficheros
 # --------------------------------------------------------------------------
 
-def load(paths: list[str]) -> Dataset:
+def load(paths: list[str], on_progress=None) -> Dataset:
     """Parsea y funde varios crudos en un único Dataset.
 
     Los bloques del backfill y el solape de 10 días del incremental hacen que
     las fechas repetidas sean la NORMA (§19.3). Deduplicar es obligatorio, y
     los conflictos de NAV se registran en vez de sobrescribirse (§19.6).
-    """
+
+    `on_progress(i, n, nombre_fichero)` — opcional, antes de parsear cada
+    fichero (1-indexado, mismo formato que `q4_ingest.FlexClient.fetch`/
+    `q4_sync.backfill`). Con `.parsed.json` ya cacheado (el caso normal
+    entre sesiones) cada iteración es casi instantánea — el aviso importa
+    sobre todo la primera vez que un histórico grande se parsea de verdad
+    desde el XML crudo (p. ej. justo después de un backfill), donde antes
+    no había ninguna señal de avance hasta que TODO terminaba."""
     # Un "chunk" columnar por fichero y por tabla, fundidos con
     # _merge_columnar() (ver su docstring: alinea columnas que no coinciden
     # entre ficheros, p. ej. movements con CashTransaction vs Transfer) y
     # UN SOLO pd.DataFrame() al final por tabla — no uno por fichero.
     acc: dict[str, list[dict[str, list]]] = {k: [] for k in _TABLE_KEYS}
     base = "EUR"
-    for p in paths:
+    n = len(paths)
+    for i, p in enumerate(paths, start=1):
+        if on_progress:
+            on_progress(i, n, os.path.basename(p))
         r = parse_file_cached(p)
         base = r.get("base_currency", base)
         for k in _TABLE_KEYS:
