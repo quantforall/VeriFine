@@ -212,6 +212,31 @@ def init_session_storage(drive: DriveFolder | None, session_id: str | None = Non
     return local_dir
 
 
+def known_raw_names(local_dir: str) -> list[str]:
+    """Nombres (basenames, terminados en `.xml`) de los extractos
+    "disponibles" en `local_dir` — incluye tanto los que están físicamente
+    descargados como los que sólo tienen su `.parsed.json` (ver
+    `init_session_storage`: el XML se salta a propósito cuando su
+    `.parsed.json` ya cubre el análisis, `q4_parser.parse_file_cached` no
+    necesita el crudo en ese caso).
+
+    Usar esto en vez de `glob.glob(RAW_DIR + '/*.xml')` en cualquier sitio
+    que quiera saber "¿hay datos ya sincronizados?" — ese glob por sí solo
+    ahora da FALSOS NEGATIVOS para cualquier usuario que ya tuviera su
+    histórico parseado en una sesión anterior (la mayoría, en producción):
+    ve un RAW_DIR con `.parsed.json` pero sin los `.xml` correspondientes
+    y concluye "no hay nada", cuando sí lo hay."""
+    if not os.path.isdir(local_dir):
+        return []
+    names = set()
+    for entry in os.listdir(local_dir):
+        if entry.endswith(".xml"):
+            names.add(entry)
+        elif entry.endswith(_PARSED_SUFFIX):
+            names.add(entry[: -len(_PARSED_SUFFIX)])
+    return sorted(names)
+
+
 def sync_up(drive: DriveFolder | None, raw_dir: str, *basenames: str) -> None:
     """Sube (crea o sobrescribe) cada nombre de `raw_dir` a la carpeta Drive
     que le corresponda por sufijo — XML/, JSON/ o la raíz (ver

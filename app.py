@@ -1397,8 +1397,13 @@ def _incremental_recompute_fn() -> dict[str, float]:
     """TWR EUR de cada año CERRADO sobre TODO el histórico (canario §19.6),
     para q4_sync.daily_job() — mismo cálculo que q4_daily.py:recompute_fn,
     duplicado a propósito: son entrypoints independientes (uno es el cron,
-    éste la app interactiva), no comparten proceso."""
-    all_raws = sorted(glob.glob(os.path.join(RAW_DIR, "*.xml")))
+    éste la app interactiva), no comparten proceso.
+
+    `ST.known_raw_names()`, no `glob.glob(*.xml)` — el XML de un histórico
+    ya parseado en una sesión anterior puede no estar físicamente aquí (ver
+    `q4_storage.init_session_storage`), pero `P.load()` funciona igual
+    porque su `.parsed.json` sí está."""
+    all_raws = [os.path.join(RAW_DIR, n) for n in ST.known_raw_names(RAW_DIR)]
     ds_all = P.load(all_raws)
     dates = ds_all.dates
     this_year = dt.date.today().year
@@ -1838,7 +1843,13 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
     # anterior, cargarlos solos — el panel no debe quedarse en blanco
     # esperando a que se reintroduzca el token sólo para volver a ver lo
     # que ya se tenía.
-    local = sorted(glob.glob(os.path.join(RAW_DIR, "*.xml"))) or \
+    #
+    # ST.known_raw_names(), no glob.glob(*.xml): con el histórico ya
+    # parseado en una sesión anterior, init_session_storage() salta a
+    # propósito la descarga del XML crudo (su .parsed.json ya basta, ver su
+    # docstring) — un glob de *.xml a secas ve el RAW_DIR "vacío" y manda a
+    # Configuración a un usuario que SÍ tiene datos.
+    local = [os.path.join(RAW_DIR, n) for n in ST.known_raw_names(RAW_DIR)] or \
         sorted(glob.glob("./data/*.xml"))
     if local:
         st.sidebar.caption(f"Usando {len(local)} extractos del almacén ({RAW_DIR})")
@@ -3065,7 +3076,9 @@ def main():
     # extractos en el almacén (comprobación barata por fichero, antes de
     # tocar nada de sesión); la primera vez, o tras "Borrar todo", se abre
     # solo porque hace falta rellenarlo.
-    has_data = bool(glob.glob(os.path.join(RAW_DIR, "*.xml")))
+    # ST.known_raw_names(), no glob.glob(*.xml) — mismo motivo que en
+    # sidebar_source(): el XML puede faltar a propósito si ya está parseado.
+    has_data = bool(ST.known_raw_names(RAW_DIR))
     with st.sidebar.expander("Conexión y licencia", expanded=not has_data):
         license_mode = license_gate()
         token, qid = _connection_fields()

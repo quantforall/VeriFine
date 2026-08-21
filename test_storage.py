@@ -242,3 +242,40 @@ def test_wipe_drive_folder_clears_root_and_subfolders():
 
 def test_wipe_drive_folder_noop_without_drive():
     ST.wipe_drive_folder(None)  # no debe explotar
+
+
+# --------------------------------------------------------------------------
+# known_raw_names() — regresión: sidebar_source()/has_data en app.py usaban
+# glob.glob(*.xml) para saber "¿hay datos ya sincronizados?", y con el XML
+# omitido a propósito cuando ya está parseado (ver init_session_storage),
+# ese glob daba FALSO NEGATIVO — un usuario con histórico ya sincronizado
+# veía sólo la pestaña Configuración al recargar la página.
+# --------------------------------------------------------------------------
+
+def test_known_raw_names_includes_xml_without_parsed_json(tmp_path):
+    (tmp_path / "a.xml").write_bytes(b"<xml/>")
+    assert ST.known_raw_names(str(tmp_path)) == ["a.xml"]
+
+
+def test_known_raw_names_includes_xml_covered_only_by_parsed_json(tmp_path):
+    """El caso que causaba el bug: el XML no está descargado, sólo su
+    .parsed.json (omitido a propósito, ver _already_parsed_names)."""
+    (tmp_path / "a.xml.parsed.json").write_text('{"nav": {}}')
+    assert ST.known_raw_names(str(tmp_path)) == ["a.xml"]
+
+
+def test_known_raw_names_deduplicates_when_both_present(tmp_path):
+    (tmp_path / "a.xml").write_bytes(b"<xml/>")
+    (tmp_path / "a.xml.parsed.json").write_text('{"nav": {}}')
+    assert ST.known_raw_names(str(tmp_path)) == ["a.xml"]
+
+
+def test_known_raw_names_empty_dir():
+    assert ST.known_raw_names("") == []           # ni siquiera existe: no explota
+
+
+def test_known_raw_names_ignores_unrelated_files(tmp_path):
+    (tmp_path / "a.xml").write_bytes(b"<xml/>")
+    (tmp_path / "state_Q1.json").write_text("{}")
+    (tmp_path / "license.json").write_text("{}")
+    assert ST.known_raw_names(str(tmp_path)) == ["a.xml"]
