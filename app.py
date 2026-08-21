@@ -167,6 +167,15 @@ _theme_watcher = components.declare_component(
 # candado puesto un día entero por un fallo real.
 LOCK_STALE_S = 900
 
+# Alto de la cabecera fija de Streamlit — de fábrica son 52px; se agranda
+# para que quepa el título grande (icono+"VeriFine"+"by Quant4all"+
+# coletilla, ver _inject_header_title()) casi a su tamaño original del
+# cuerpo (90%) en vez de encogerlo a la fuerza para caber en 52px (a
+# petición expresa). Usado tanto en THEME_CSS (la propia cabecera y el
+# padding-top que compensa el contenido de abajo) como en
+# _inject_header_title() (para centrar verticalmente lo que inyecta).
+_HEADER_H = 68
+
 THEME_CSS = f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@300;400;500;600;700&display=swap');
@@ -223,9 +232,9 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
 
 /* --- marca --- */
 .vf-brand {{ display:flex; align-items:center; gap:9px; font-family:'Fira Code',monospace;
-  font-weight:700; font-size:20px; letter-spacing:.02em; color:var(--fg);
+  font-weight:700; font-size:20px; letter-spacing:.02em; color:var(--color-positive);
   padding:2px 0 10px; }}
-.vf-brand .vf-ico {{ color:var(--color-positive); }}
+.vf-brand .vf-ico {{ color:var(--fg); }}
 .vf-title {{ font-size:30px; font-weight:700; margin:0;
   text-shadow:0 0 12px rgba(34,197,94,.12); }}
 .vf-headline {{ display:flex; align-items:center; gap:12px; margin:2px 0 2px; }}
@@ -410,6 +419,24 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
 [data-testid="stHeader"] *, [data-testid="stToolbar"] * {{
   color: var(--fg) !important;
 }}
+/* Cabecera agrandada (52px de fábrica -> {_HEADER_H}px) a petición
+   expresa, para que quepa el título grande (icono+"VeriFine"+"by
+   Quant4all"+coletilla, ver _inject_header_title()) casi a su tamaño
+   original del cuerpo (90%), no encogido a la fuerza para caber en 52px.
+   El contenido de la página asume el alto de fábrica para su
+   padding-top — se compensa la diferencia más abajo (stMain/block-container)
+   para que la cabecera más alta no tape la primera línea. */
+[data-testid="stHeader"] {{ height:{_HEADER_H}px !important; }}
+[data-testid="stToolbar"] {{ padding-top:{(_HEADER_H - 52) // 2}px !important; }}
+[data-testid="stAppViewContainer"] > .main {{
+  padding-top:{_HEADER_H - 52}px !important;
+}}
+/* El título de la cabecera fija ("VeriFine by Quant4all | Audita tu
+   cuenta de IBKR", con el icono) YA NO va aquí como ::before de una sola
+   cadena — con tres tamaños/colores de texto y un <svg>, un único
+   `content` de texto plano no puede darlos (::before/::after son sólo DOS
+   huecos, y tampoco aceptan HTML). Ver _inject_header_title(), que lo
+   mete como HTML real desde un <iframe> que alcanza el documento padre. */
 
 /* Streamlit Cloud (comprobado en vivo en verifine.streamlit.app, distinto
    de lo que se ve en local) NO pinta el fondo oscuro en el CONTENEDOR de
@@ -2911,6 +2938,92 @@ def _onboarding_screenshot(label: str, filename: str):
         st.image(path, use_container_width=True)
 
 
+def _inject_header_title() -> None:
+    """El título grande que antes iba arriba del todo del cuerpo (icono +
+    "VeriFine" + coletilla, ver git blame) vive ahora SÓLO en la cabecera
+    fija de Streamlit ([data-testid="stHeader"], siempre visible, no se va
+    con el scroll — a petición expresa) — al 90% de aquel tamaño (la
+    cabecera mide {_HEADER_H}px, ver su definición, agrandada para que
+    quepa) y con "by Quant4all" añadido en medio, a la mitad del tamaño de
+    "VeriFine".
+
+    Reutiliza las clases `vf-headline`/`vf-title`/`vf-tagline`/`vf-ico` de
+    THEME_CSS tal cual (mismo verde del icono, mismo resplandor del
+    título, la coletilla ya en 0.6em relativo — así que escala sola con
+    `title_size`) — el HTML se inyecta en el documento PADRE, no en un
+    iframe aislado, así que SÍ hereda ese CSS. stHeader es DOM propio de
+    Streamlit — st.markdown() no puede insertar nada ahí, sólo añade a la
+    columna de contenido normal. En su lugar, esto corre en un <iframe>
+    (components.html) y alcanza `window.parent.document` — mismo origen
+    (todo Streamlit), el navegador lo permite. Con guarda de idempotencia
+    (getElementById): main() se re-ejecuta entero en cada rerun de
+    Streamlit, así que sin la guarda se apilaría una copia nueva cada vez."""
+    # 0.9 (90%) medía 932px de ancho en vivo — no cabía en los 644px
+    # disponibles en la cabecera (entre la barra lateral y Deploy/⋮), se
+    # cortaba por la izquierda. 0.56 es lo que de verdad cabe con margen,
+    # comprobado en vivo.
+    _SCALE = 0.56
+    icon_size = round(60 * _SCALE)
+    title_size = round(60 * _SCALE)
+    by_size = round(title_size * 0.5)
+    # [data-testid="stHeader"] * { color: var(--fg) !important; } (más
+    # arriba en THEME_CSS, puesta para forzar el color de los iconos
+    # NATIVOS de Streamlit dentro de la cabecera) alcanza también a
+    # cualquier cosa que se inyecte aquí dentro — sin el !important propio
+    # de cada span, esa regla se comía el verde/blanco/apagado y lo dejaba
+    # todo en var(--fg) (comprobado en vivo: el icono y "VeriFine" salían
+    # en el color de texto normal, no en verde). El propio icono necesita
+    # el color en su MISMO tag (el selector universal `*` también lo
+    # alcanza a él directamente, envolverlo en un span de color no basta).
+    icon_html = svg("target", icon_size).replace(
+        'class="vf-ico"', f'class="vf-ico" style="color:{POS} !important"', 1)
+    inner_html = (
+        f'{icon_html}'
+        f'<h1 class="vf-title" style="font-size:{title_size}px">'
+        f'<span style="color:{POS} !important;">VeriFine</span> '
+        f'<span style="font-size:{by_size}px;font-weight:600;color:{FG} !important;">'
+        f'by Quant4all</span> '
+        f'<span class="vf-tagline" style="color:{MUTED} !important;">'
+        f'| Audita tu cuenta de IBKR</span></h1>'
+    )
+    components.html(f"""
+        <script>
+        (function() {{
+          var doc = window.parent.document;
+          var header = doc.querySelector('[data-testid="stHeader"]');
+          if (!header) return;
+          // Busca-o-crea, NO "si ya existe no lo toques": en el primer
+          // render de la sesión, el tema puede caer por defecto en "dark"
+          // hasta que el componente de detección avisa de verdad (ver
+          // _apply_theme_palette) — con "si ya existe, no lo toques" ese
+          // primer color (a veces el equivocado) se quedaba fijo para
+          // siempre, porque este elemento vive FUERA del ciclo normal de
+          // rerender de Streamlit (nadie más lo vuelve a tocar). Actualizar
+          // el innerHTML en CADA rerun deja que la corrección de tema
+          // (POS/FG/MUTED ya resueltos bien) llegue aquí también.
+          var el = doc.getElementById('vf-header-title');
+          if (!el) {{
+            el = doc.createElement('div');
+            el.id = 'vf-header-title';
+            el.className = 'vf-headline';
+            el.style.cssText = 'position:absolute;left:50%;top:50%;'
+              + 'transform:translate(-50%,-50%);white-space:nowrap;'
+              + 'pointer-events:none;margin:0;overflow:hidden;'
+              // Con centrado + ancho fijo, una ventana más estrecha que el
+              // portátil normal donde esto se probó (1280px, sobraban
+              // 138px antes de "Deploy") podría acabar montándose sobre
+              // Deploy/⋮ — este tope, con elipsis, es la red de seguridad
+              // para esos casos en vez de fiarlo todo a un tamaño que sólo
+              // se probó a un ancho.
+              + 'max-width:calc(100% - 220px);text-overflow:ellipsis;';
+            header.appendChild(el);
+          }}
+          el.innerHTML = {json.dumps(inner_html)};
+        }})();
+        </script>
+    """, height=0)
+
+
 def _clickable_logo(filename: str, href: str, alt: str, title: str, subtitle: str) -> None:
     """CTA con logo clicable — SOLO para el paso "Introduce tu licencia" de
     configuracion_view() (el de Substack). Opcional, igual que
@@ -2957,9 +3070,15 @@ def _clickable_logo(filename: str, href: str, alt: str, title: str, subtitle: st
           a {{ display:flex; align-items:center; gap:16px; border-radius:8px;
             padding:14px 20px; border:1px solid {BORDER}; background:{CARD};
             text-decoration:none; box-sizing:border-box; height:100%;
-            transition:border-color .15s ease, transform .15s ease;
+            transition:border-color .15s ease;
             font-family:'Fira Sans',Helvetica,Arial,sans-serif; }}
-          a:hover {{ border-color:{POS}; transform:translateY(-1px); }}
+          /* Sin transform:translateY en :hover a propósito — el iframe mide
+             justo el alto del contenido (ver components.html más abajo), así
+             que desplazar el elemento hacia arriba recortaba el borde de
+             ARRIBA contra el borde del propio iframe (se veía el resto del
+             borde iluminarse en verde al pasar el ratón, pero no el de
+             arriba — comprobado en vivo). Sólo el color, sin movimiento. */
+          a:hover {{ border-color:{POS}; }}
           a:focus-visible {{ outline:2px solid {POS}; outline-offset:2px; }}
           .logo {{ width:52px; height:52px; flex:0 0 auto; border-radius:8px;
             overflow:hidden; display:block; }}
@@ -3154,18 +3273,13 @@ def main():
     _theme_result = _theme_watcher(key="theme_watcher")
     _detected_theme = (_theme_result or {}).get("theme", "dark")
     _apply_theme_palette(_detected_theme)
+    _inject_header_title()
 
-    # Título de página arriba del todo — SIEMPRE visible desde el primer
-    # instante, antes de conectar o parsear nada: sin esto el cuerpo
-    # principal queda en blanco durante la sincronización con IBKR (spinners
-    # de parseo/cálculo incluidos) y da la sensación de que la app se ha
-    # quedado colgada. Tamaño doble del original (30px -> 60px; el icono y
-    # la coletilla, en em, escalan con él).
-    st.markdown(
-        f'<div class="vf-headline">{svg("target", 60)}'
-        f'<h1 class="vf-title" style="font-size:60px">VeriFine '
-        f'<span class="vf-tagline">| Audita tu cuenta de IBKR</span></h1></div>',
-        unsafe_allow_html=True)
+    # El título grande que iba aquí (icono+"VeriFine"+coletilla, arriba del
+    # todo del cuerpo) se ha movido a la cabecera fija de Streamlit — ver
+    # _inject_header_title() más arriba — para que sea SIEMPRE visible sin
+    # depender de estar en la primera pantalla ni de hacer scroll hasta
+    # arriba (a petición expresa). No se duplica aquí también.
     st.sidebar.markdown(f'<div class="vf-brand">{svg("target", 22)}VeriFine</div>',
                         unsafe_allow_html=True)
 
@@ -3227,9 +3341,15 @@ def main():
     # y deshabilitado, el valor devuelto es siempre la lista completa.
     accounts_locked = license_mode == "free"
     accounts = st.sidebar.multiselect(
-        "Cuentas", ds.accounts, default=ds.accounts, disabled=accounts_locked,
-        help="Requiere licencia completa — con la gratuita se analiza siempre "
-            "con todas las cuentas." if accounts_locked else None)
+        "Cuentas", ds.accounts, default=ds.accounts, disabled=accounts_locked)
+    if accounts_locked:
+        # Texto SIEMPRE visible, no un tooltip que sólo aparece al pasar el
+        # ratón — con el widget deshabilitado no hay "intento" que detectar
+        # (el navegador bloquea la interacción antes de que llegue a
+        # Streamlit), así que el aviso tiene que verse sin tener que tocar
+        # nada (a petición expresa).
+        st.sidebar.caption("Requiere licencia completa — con la gratuita se "
+                          "analiza siempre con todas las cuentas.")
 
     # Benchmark: se elige AQUÍ, al principio, y de ahí en adelante aparece
     # como comparativa en Evolución, Riesgo, la tabla por año y las ventanas
@@ -3338,16 +3458,19 @@ def main():
         # completo por el reset de arriba, así que deshabilitado siempre
         # muestra ese rango, nunca uno parcial.
         period_locked = license_mode == "free"
-        period_help = ("Requiere licencia completa — con la gratuita se analiza "
-                       "siempre el rango completo." if period_locked else None)
         st.sidebar.slider("Periodo de análisis", min_value=lo_d, max_value=hi_d,
                           key="sld", on_change=_from_slider, format="DD/MM/YYYY",
-                          disabled=period_locked, help=period_help)
+                          disabled=period_locked)
         cA, cB = st.sidebar.columns(2)
         cA.date_input("Desde", min_value=lo_d, max_value=hi_d, key="din_from",
                       on_change=_from_inputs, format="DD/MM/YYYY", disabled=period_locked)
         cB.date_input("Hasta", min_value=lo_d, max_value=hi_d, key="din_to",
                       on_change=_from_inputs, format="DD/MM/YYYY", disabled=period_locked)
+        if period_locked:
+            # Texto SIEMPRE visible, mismo motivo que el de cuentas arriba —
+            # con los widgets deshabilitados no hay "intento" que detectar.
+            st.sidebar.caption("Requiere licencia completa — con la gratuita "
+                              "se analiza siempre el rango completo.")
         lo_sel, hi_sel = st.session_state.sld
         lo_s, hi_s = lo_sel.strftime("%Y%m%d"), hi_sel.strftime("%Y%m%d")
         dates = [d for d in funded if lo_s <= d <= hi_s]
