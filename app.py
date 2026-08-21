@@ -899,6 +899,29 @@ def _attr(start: str, end: str, currency: str | None,
                              tuple(accounts) if accounts else None)
 
 
+@st.cache_data(show_spinner="Verificando integridad de los datos…",
+               hash_funcs={_RawPaths: _stable_cache_key})
+def _cached_selfcheck(paths: _RawPaths) -> list[dict]:
+    """Envoltorio cacheado de SC.run_checks() — mismo patrón que
+    _cached_attribute()/_cached_trades()/_cached_portfolio(): una vez por
+    histórico, no en cada rerun.
+
+    Sustituye al guard `id(ds) != st.session_state.get("_sc_id")` que había
+    antes (ver git blame): `ds` sale de `load_paths()`, un `@st.cache_data`,
+    y Streamlit SIEMPRE devuelve una copia nueva del valor cacheado en cada
+    llamada — incluso en un acierto de caché — para que nadie mute el
+    objeto compartido (confirmado: `f(1) is f(1)` da `False` con
+    `@st.cache_data`). Eso significa que `id(ds)` cambiaba en TODOS los
+    reruns, no solo cuando cambiaba el dataset — el guard nunca acertaba, y
+    SC.run_checks() (varios recorridos completos del histórico por cuenta,
+    más dos E.attribute() enteros para T4/T5, sin compartir nada con
+    _cached_series_inputs) se repetía en CADA interacción, no una vez por
+    dataset como decía el comentario original. Medido: ~75 ms por rerun en
+    un dataset sintético de 6 años/2 cuentas — en una cuenta real, más."""
+    ds = load_paths(paths)
+    return SC.run_checks(ds)
+
+
 @st.cache_data(show_spinner=False, hash_funcs={_RawPaths: _stable_cache_key})
 def _cached_trades(paths: _RawPaths, start: str, end: str,
                    accounts: tuple[str, ...] | None):
@@ -2825,14 +2848,12 @@ def main():
 
         # Auto-chequeo de integridad sobre los datos del usuario (§9/T4/T5/T6b): caza
         # formas de cartera que el motor aún no valida antes de mostrar números mal.
-        # Se calcula una vez por dataset (no depende del selector), se cachea en sesión.
-        if st.session_state.get("_sc_id") != id(ds):
-            with st.spinner("Verificando integridad de los datos…"):
-                st.session_state["_sc"] = SC.run_checks(ds)
-            st.session_state["_sc_id"] = id(ds)
-        for issue in st.session_state["_sc"]:
+        # _cached_selfcheck() ya se calcula una vez por histórico, no en cada rerun
+        # (ver su docstring — el guard basado en id(ds) que había aquí no funcionaba).
+        sc_issues = _cached_selfcheck(_RawPaths(st.session_state["paths"]))
+        for issue in sc_issues:
             (st.error if issue["level"] == "error" else st.warning)(issue["msg"])
-        if not st.session_state["_sc"]:
+        if not sc_issues:
             st.caption("Comprobaciones de integridad superadas: el NAV reconstruye por "
                        "cuenta, la atribución cierra y es invariante a la moneda.")
 

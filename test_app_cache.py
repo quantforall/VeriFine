@@ -34,16 +34,25 @@ def _mini_xml_dates(*totals: float) -> str:
     """XML con una cuenta ("U1") y una fila de NAV por cada total en
     `totals`, en fechas consecutivas a partir de 2026-01-01 — lo justo para
     que nav_series()/accruals() tengan columna "account" y, con >= 2
-    fechas, para que build_series() no falle por "serie insuficiente"."""
+    fechas, para que build_series() no falle por "serie insuficiente". Con
+    tipo de cambio USD (aunque no se use ninguna posición en USD) para que
+    SC.run_checks() —que compara EUR vs. USD para T4— no falle por falta
+    de tipos de cambio."""
     rows = "".join(
         f'<EquitySummaryByReportDateInBase accountId="U1" reportDate="202601{i+1:02d}"'
         f' total="{t}" cash="{t}" stock="0"/>'
         for i, t in enumerate(totals)
     )
+    fx_rows = "".join(
+        f'<ConversionRate reportDate="202601{i+1:02d}" fromCurrency="USD" '
+        'toCurrency="EUR" rate="1.1"/>'
+        for i in range(len(totals))
+    )
     return (
         '<FlexQueryResponse><FlexStatements>'
         '<FlexStatement accountId="U1" fromDate="20260101" toDate="20260131">'
         f'<EquitySummaryInBase>{rows}</EquitySummaryInBase>'
+        f'<ConversionRates>{fx_rows}</ConversionRates>'
         '</FlexStatement></FlexStatements></FlexQueryResponse>')
 
 
@@ -183,6 +192,33 @@ def test_cached_series_inputs_shared_across_different_periods(tmp_path, monkeypa
     assert len(calls) == 1
     assert a.total == pytest.approx(0.01)                   # 1010/1000 - 1
     assert b.total == pytest.approx(1000 / 1010 - 1)
+
+
+def test_cached_selfcheck_survives_different_session_directories(tmp_path, monkeypatch):
+    """Regresión: el guard `id(ds) != st.session_state["_sc_id"]` que había
+    antes de _cached_selfcheck() nunca acertaba (`st.cache_data` devuelve
+    una copia nueva en cada llamada, `id()` distinto siempre) — SC.run_checks()
+    se repetía en cada rerun. Aquí se prueba que, de verdad, se ejecuta una
+    sola vez para el mismo histórico."""
+    calls = []
+    orig = app.SC.run_checks
+
+    def spy(*a, **k):
+        calls.append(1)
+        return orig(*a, **k)
+
+    monkeypatch.setattr(app.SC, "run_checks", spy)
+    d1, d2 = tmp_path / "s1", tmp_path / "s2"
+    d1.mkdir()
+    d2.mkdir()
+    name = "case_selfcheck_survives_sessions.xml"
+    xml = _mini_xml_dates(1000.0, 1010.0)
+    p1 = app._RawPaths((_write(d1, name, xml),))
+    p2 = app._RawPaths((_write(d2, name, xml),))
+
+    app._cached_selfcheck(p1)
+    app._cached_selfcheck(p2)
+    assert len(calls) == 1
 
 
 def test_cached_trades_survives_different_session_directories(tmp_path, monkeypatch):
