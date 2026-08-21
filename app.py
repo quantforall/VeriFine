@@ -1247,6 +1247,12 @@ def _run_incremental_sync(token: str, qid: str, state_path: str):
                 elif res["status"] == "no_new_data":
                     status.update(label="Ya estabas al día", state="complete")
                     st.info("Sin sesiones nuevas — nada que traer.")
+                    if res.get("raw_path"):
+                        # El XML ya se descargó (aunque no trajera fechas
+                        # nuevas) — se sube igual para no perderlo de vista
+                        # en cuanto termine esta sesión.
+                        ST.sync_up(st.session_state.get("_drive_folder"), RAW_DIR,
+                                  os.path.basename(res["raw_path"]))
                 else:
                     status.update(label="No se pudo sincronizar", state="error")
                     st.error(res.get("reason", res["status"]))

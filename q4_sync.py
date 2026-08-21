@@ -355,7 +355,13 @@ def daily_job(client: FlexClient, state_path: str, query_id: str,
     nav, dates = parse_fn(res["raw_path"])
     if not dates or max(dates) <= prev_watermark:
         log.info("Sin fechas nuevas (fin de semana, festivo o cierre no generado)")
-        return dict(status="no_new_data", watermark=state.watermark)
+        # `raw_path` va también aquí aunque no traiga fechas nuevas: el XML ya
+        # se descargó y se guardó en disco (fetch() no vuelve a comprobar
+        # nada), así que quien llame puede subirlo igualmente a Drive — sin
+        # esto, el crudo se queda huérfano en el RAW_DIR de ESTA sesión y se
+        # pierde de vista en cuanto termine (ver el mismo motivo en el "ok"
+        # de abajo).
+        return dict(status="no_new_data", watermark=state.watermark, raw_path=res["raw_path"])
 
     update_watermark(state, state_path, dates)
     _tick(3, "Recalculando el histórico completo…")
@@ -365,4 +371,4 @@ def daily_job(client: FlexClient, state_path: str, query_id: str,
 
     return dict(status="ok", watermark=state.watermark,
                 new_dates=[d for d in dates if d > prev_watermark],
-                golden_drift=drift)
+                golden_drift=drift, raw_path=res["raw_path"])

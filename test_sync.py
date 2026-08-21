@@ -194,6 +194,11 @@ def test_daily_job_ok_updates_watermark_and_checks_golden(tmp_path):
     assert res["status"] == "ok"
     assert res["new_dates"] == ["20260102"]
     assert S.SyncState.load(p, "Q1").watermark == "20260102"
+    # Regresión: sin `raw_path` en el resultado, app.py nunca sube a Drive el
+    # XML nuevo ni el state.json con el watermark actualizado — la sesión
+    # siguiente (rehidratada desde Drive) veía el watermark VIEJO aunque la
+    # sincronización hubiera ido bien en local (ver app.py `_run_incremental_sync`).
+    assert res["raw_path"] == "new.xml"
 
 
 def test_daily_job_no_new_dates_from_parse(tmp_path):
@@ -205,3 +210,6 @@ def test_daily_job_no_new_dates_from_parse(tmp_path):
                       parse_fn=lambda path: ({}, []),
                       recompute_fn=lambda: {})
     assert res["status"] == "no_new_data"
+    # También aquí: el XML ya se descargó, aunque resultara sin fechas
+    # nuevas — sin `raw_path` se queda huérfano en el RAW_DIR de la sesión.
+    assert res["raw_path"] == "new.xml"
