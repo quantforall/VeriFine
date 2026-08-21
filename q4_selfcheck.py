@@ -31,7 +31,13 @@ def run_checks(ds: P.Dataset, currency: str = "EUR") -> list[dict]:
     out: list[dict] = []
     if ds.nav.empty:
         return out
-    fx = E.FX(P.fx_matrix(ds), ds.base_currency)
+    # Calculado una vez y compartido con las DOS llamadas a E.attribute() de
+    # T4/T5 más abajo (EUR y USD, mismas cuentas=None) — sin esto, cada
+    # attribute() recalculaba fx_matrix/nav_series/currency_buckets/accruals/
+    # flows del dataset COMPLETO por su cuenta (perfilado sobre datos
+    # reales: pasaba de 3 a 1 llamada a fx_matrix con este cambio).
+    inputs = E.precompute_series_inputs(ds, None)
+    fx = E.FX(inputs.fx_matrix, ds.base_currency)
     boot = set(ds.bootstrapped)
 
     # T6b — el NAV de cada cuenta reconstruye desde los cubos por divisa.
@@ -54,14 +60,15 @@ def run_checks(ds: P.Dataset, currency: str = "EUR") -> list[dict]:
                      "activo o divisa que el parser aún no captura (opciones, bonos, "
                      "otra moneda base): los números de esa cuenta pueden estar mal.")))
 
-    # T5 / T4 / §9 — sobre el consolidado.
-    nav_all = P.nav_series(ds)
+    # T5 / T4 / §9 — sobre el consolidado. inputs.navs es el mismo
+    # nav_series(ds) de siempre (accounts=None), ya calculado arriba.
+    nav_all = inputs.navs
     dates = [d for d in sorted(nav_all) if nav_all[d] > 0]
     if len(dates) < 2:
         return out
     a0, a1 = dates[0], dates[-1]
     try:
-        att = E.attribute(ds, a0, a1, analysis_currency=currency)
+        att = E.attribute(ds, a0, a1, analysis_currency=currency, precomputed=inputs)
     except E.UndefinedReturn as e:
         out.append(dict(level="warning", check="§9", account=None,
                         msg=f"La serie tiene un tramo no calculable (§9): {e}"))
@@ -71,7 +78,7 @@ def run_checks(ds: P.Dataset, currency: str = "EUR") -> list[dict]:
         out.append(dict(level="error", check="T5", account=None,
             msg=(f"La atribución no cierra (residuo {att.closes():.1e}): "
                  "Estrategia × Divisa ≠ Total. Hay un error de cálculo.")))
-    au = E.attribute(ds, a0, a1, analysis_currency="USD")
+    au = E.attribute(ds, a0, a1, analysis_currency="USD", precomputed=inputs)
     if abs(att.strategy - au.strategy) > 1e-9:
         out.append(dict(level="error", check="T4", account=None,
             msg=(f"La estrategia difiere en EUR y USD (Δ {abs(att.strategy - au.strategy):.1e}); "

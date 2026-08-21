@@ -473,18 +473,18 @@ def load(paths: list[str]) -> Dataset:
         have |= set(zip(ds.cash.get("account", []), ds.cash.get("date", []))) \
             if not ds.cash.empty else set()
         rows_p, rows_c = [], []
-        for _, r in boot.iterrows():
-            if (r["account"], r["date"]) in have:
+        for r in boot.itertuples(index=False):
+            if (r.account, r.date) in have:
                 continue
-            if r["kind"] == "position":
-                rows_p.append(dict(account=r["account"], date=r["date"],
-                                   conid=f"BOOT_{r['currency']}", symbol="BOOTSTRAP",
-                                   currency=r["currency"], quantity=0.0, price=0.0,
-                                   value_local=r["value_local"]))
+            if r.kind == "position":
+                rows_p.append(dict(account=r.account, date=r.date,
+                                   conid=f"BOOT_{r.currency}", symbol="BOOTSTRAP",
+                                   currency=r.currency, quantity=0.0, price=0.0,
+                                   value_local=r.value_local))
             else:
-                rows_c.append(dict(account=r["account"], date=r["date"],
-                                   currency=r["currency"],
-                                   balance_local=r["value_local"]))
+                rows_c.append(dict(account=r.account, date=r.date,
+                                   currency=r.currency,
+                                   balance_local=r.value_local))
         if rows_p:
             ds.positions = pd.concat([ds.positions, pd.DataFrame(rows_p)], ignore_index=True)
         if rows_c:
@@ -597,8 +597,8 @@ def flows(ds: Dataset, accounts: list[str] | None = None) -> dict[str, list[tupl
         internal = m["counterparty"].isin(accounts)
         m = m[~internal]
     out: dict[str, list[tuple[str, float]]] = {}
-    for _, r in m.iterrows():
-        out.setdefault(r["date"], []).append((r["currency"], float(r["amount_local"])))
+    for r in m.itertuples(index=False):
+        out.setdefault(r.date, []).append((r.currency, float(r.amount_local)))
     return out
 
 
