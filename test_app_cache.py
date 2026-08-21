@@ -394,3 +394,12 @@ def test_stable_cache_key_does_not_collide_across_different_content(tmp_path, _s
     assert len(_spy_on_parse) == 2   # dos entradas de caché distintas, ninguna reutilizada
     # y de verdad son datos distintos, no sólo "no se compartió la llamada"
     assert set(ds_a.nav["total"]) != set(ds_b.nav["total"])
+
+
+def test_tab_gate_blocks_only_the_blocked_tier():
+    """Licencia de 3 niveles: Efecto divisa/Operaciones/Informe se
+    desbloquean con "free" igual que con "full" -- sólo "blocked" (sin
+    licencia válida) los oculta."""
+    assert app._tab_gate("full") is True
+    assert app._tab_gate("free") is True
+    assert app._tab_gate("blocked") is False

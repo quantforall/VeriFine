@@ -14,11 +14,13 @@ vía .streamlit/config.toml + el CSS inyectado más abajo.
 from __future__ import annotations
 
 import os
+import re
 import json
 import time
 import glob
 import shutil
 import uuid
+import base64
 import logging
 import threading
 import datetime as dt
@@ -368,6 +370,11 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
 .vf-callout-info svg {{ color:var(--series); }}
 .vf-callout-warn {{ background:rgba(245,158,11,.08); border-color:rgba(245,158,11,.35); }}
 .vf-callout-warn svg {{ color:var(--bench); }}
+/* El CTA de Substack (paso "Introduce tu licencia" de la guía) NO usa
+   estas clases — va por components.html() en su propio <iframe>, con su
+   CSS inline (ver _clickable_logo) porque var(--...) no cruza al iframe y
+   un <style> con @keyframes dentro de st.markdown(unsafe_allow_html=True)
+   salía truncado. Nada que definir aquí. */
 .vf-kv-grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr));
   gap:8px; margin:10px 0 4px; }}
 .vf-kv-item {{ background:var(--card); border:1px solid var(--border); border-radius:8px;
@@ -558,9 +565,9 @@ code, .vf-num {{ font-variant-numeric: tabular-nums; font-feature-settings: "tnu
 [data-baseweb="calendar"] [role="gridcell"][aria-label^="Selected"] * {{
   color: #04140A !important;
 }}
-/* Los días fuera de rango (p. ej. el selector "Periodo de análisis": en
-   modo de prueba lleva min_value porque el periodo ANALIZABLE sí está
-   capado a 6 meses, aunque la descarga no lo esté — ver TRIAL_MONTHS) los
+/* Los días fuera de rango (p. ej. el selector "Periodo de análisis": con
+   licencia gratuita lleva min_value porque el periodo ANALIZABLE sí está
+   capado a 12 meses, aunque la descarga no lo esté — ver FREE_MONTHS) los
    atenúa BaseWeb bajándoles el color: comprobado en una app de prueba con
    min_value, gris rgb(163,168,184) frente al blanco de los elegibles, y
    aria-label que empieza por "Not available" en vez de "Choose". El
@@ -695,18 +702,22 @@ def _fetch_valid_codes_cached() -> list[str] | None:
     return codes
 
 
-TRIAL_MONTHS = 6  # histórico máximo ANALIZABLE sin licencia activa — la
-                  # descarga/sincronización no tiene tope (§_history_start_field)
+FREE_MONTHS = 12  # histórico máximo ANALIZABLE con licencia GRATIS (código
+                  # VF-FREE del email de bienvenida de Substack) — la
+                  # descarga/sincronización no tiene tope (§_history_start_field).
+                  # Sin ningún código, no hay tramo: el análisis queda
+                  # bloqueado del todo (ver license_gate/_drive_gate).
+
+SUBSTACK_URL = "https://quant4all.substack.com/"  # ver configuracion_view(), paso 02
 
 
 def license_gate() -> str:
-    """Nunca bloquea del todo — la conversión pasa por dejar probar la app,
-    no por dejarla fuera. Devuelve "full" (licencia válida: sin límites) o
-    "trial" (sin licencia — o caducada, o nunca hubo). main() usa "trial"
-    para capar el PERIODO DE ANÁLISIS a TRIAL_MONTHS meses (nunca lo que se
-    puede descargar — a petición expresa, así no hay que resincronizar al
-    activar la licencia, ver _history_start_field) y para bloquear Efecto
-    divisa/Operaciones/Informe.
+    """Devuelve "full" (licencia de pago: sin límites), "free" (código
+    gratis del email de bienvenida de Substack: 12 meses, periodo/cuentas
+    fijos — ver el bloqueo de interactividad en main()) o "blocked" (sin
+    código, o código inválido: ningún panel de análisis se muestra, ver
+    _drive_gate/main — ese mensaje de invitación a suscribirse vive en
+    configuracion_view(), no aquí).
 
     El campo de licencia se pinta SIEMPRE, no solo cuando falta — así se
     puede introducir o renovar el código en cualquier momento, no solo la
@@ -723,52 +734,56 @@ def license_gate() -> str:
                '<h3 style="font-size:13px;">Licencia</h3></div>', unsafe_allow_html=True)
     typed = st.text_input(
         "Código de licencia", value=saved.code,
-        help="Lo tienes en el último correo de pago de tu suscripción de Substack.")
+        help="El de pago está en el último correo de pago de tu suscripción de Substack; "
+            "el gratis, en el email de bienvenida al suscribirte (ver pestaña Configuración).")
     if typed != saved.code:
         st.session_state.pop("_license_valid_codes", None)  # código nuevo: comprobarlo de verdad ya
     st.button("Verificar licencia")  # el propio cambio de campo ya dispara el rerun
 
-    attempt = L.LicenseState(code=typed, last_ok=saved.last_ok)
-    ok, level, msg = L.evaluate(attempt, _fetch_valid_codes_cached())
+    attempt = L.LicenseState(code=typed, last_ok=saved.last_ok, last_tier=saved.last_tier)
+    ok, tier, level, msg = L.evaluate(attempt, _fetch_valid_codes_cached())
 
     if ok and level != "warning":
         # Validado de verdad contra el manifiesto (o licencia desactivada,
         # §evaluate): éste pasa a ser el último código válido guardado.
         attempt.save(LICENSE_PATH)
         ST.sync_up(st.session_state.get("_drive_folder"), RAW_DIR, "license.json")
-        st.caption("Licencia activa ✓")
-        return "full"
+        if tier == "free":
+            st.caption("Licencia gratuita activa ✓")
+            st.info(f"Con la licencia gratuita, el análisis se limita a los últimos "
+                    f"{FREE_MONTHS} meses, y el periodo/las cuentas quedan fijos (no se "
+                    "pueden cambiar). La licencia completa quita ambos límites.")
+        else:
+            st.caption("Licencia completa activa ✓")
+        return tier
 
     if ok:  # level == "warning": modo de gracia offline, por el código YA
         # guardado — no se ha comprobado lo tecleado, así que no se toca
         # el fichero (evaluate() tampoco cambia last_ok en este caso).
         st.warning(msg)
-        return "full"
+        return tier
 
     # No autoriza: NO se toca el último código válido guardado — un
     # intento fallido (typo, código de otro mes, fallo de red al verificar)
     # no debe borrar el bueno. Se muestra el motivo REAL (`msg`, de
     # evaluate()) — antes se descartaba y siempre salía el mismo texto
-    # genérico de "Modo de prueba", así que un fallo al pedir el Gist
-    # (red, URL mal puesta en Secrets, lo que sea) era indistinguible de
-    # un código realmente erróneo, sin ninguna pista para depurarlo.
+    # genérico, así que un fallo al pedir el Gist (red, URL mal puesta en
+    # Secrets, lo que sea) era indistinguible de un código realmente
+    # erróneo, sin ninguna pista para depurarlo.
     st.error(msg)
-    st.info(f"**Modo de prueba** — el análisis se limita a {TRIAL_MONTHS} meses "
-           "(puedes descargar todo el histórico que quieras igualmente) y "
-           "Efecto divisa/Operaciones/Informe quedan bloqueadas hasta verificar "
-           "la licencia.")
-    return "trial"
+    return "blocked"
 
 
 def _tab_gate(license_mode: str) -> bool:
     """Efecto divisa/Operaciones/Informe son de pago (a petición expresa):
-    sin licencia activa no muestran nada, solo el aviso. Métricas, Cartera
-    y Configuración quedan fuera de esta guarda — se ven siempre."""
-    if license_mode == "full":
+    sin al menos licencia gratuita no muestran nada, solo el aviso.
+    Métricas, Cartera y Configuración quedan fuera de esta guarda — se ven
+    siempre (aunque con "blocked" tampoco se llega hasta aquí, ver main:
+    ese caso corta antes con configuracion_view())."""
+    if license_mode != "blocked":
         return True
-    st.info("Disponible con licencia activa. El código está en el último correo de pago "
-            "de tu suscripción de Substack — despliega **Conexión y licencia**, en el "
-            "sidebar, e introdúcelo ahí.")
+    st.info("Disponible con licencia activa (gratuita o completa) — despliega "
+            "**Conexión y licencia**, en el sidebar, e introduce tu código.")
     return False
 
 
@@ -1596,17 +1611,18 @@ def _history_start_field(qid: str, license_mode: str) -> pd.Timestamp:
     state_path = os.path.join(RAW_DIR, f"state_{qid}.json")
     existing_start = SyncState.load(state_path, qid).history_start if qid else ""
 
-    if license_mode == "trial":
-        trial_floor = (pd.Timestamp.today().normalize()
-                       - pd.DateOffset(months=TRIAL_MONTHS)).date()
-        # A petición expresa: NO se limita lo que se puede DESCARGAR en modo
-        # de prueba — solo lo que se puede ANALIZAR (ver el capado real en
-        # main(), sobre `funded`). Así, si luego se activa la licencia, ya
-        # está todo sincronizado y no hay que volver a descargar nada.
-        st.caption(f"Modo de prueba: el **análisis** se limita a los últimos "
-                  f"{TRIAL_MONTHS} meses (desde {trial_floor.strftime('%d/%m/%Y')}), "
-                  "pero puedes descargar todo el histórico que quieras desde ya — "
-                  "así no hace falta volver a sincronizar cuando actives tu licencia.")
+    if license_mode == "blocked":
+        # A petición expresa: NO se limita lo que se puede DESCARGAR sin
+        # licencia — solo lo que se puede ANALIZAR (bloqueado del todo sin
+        # al menos la gratuita, ver main()). Así, en cuanto se consigue una
+        # licencia, ya está todo sincronizado y no hay que volver a
+        # descargar nada.
+        st.caption("Sin una licencia válida no se puede **analizar** — pero puedes "
+                  "descargar todo el histórico que quieras desde ya (consigue la tuya "
+                  "en la pestaña Configuración, paso «Introduce tu licencia»).")
+    elif license_mode == "free":
+        st.caption(f"Con licencia gratuita, el **análisis** se limita a los últimos "
+                  f"{FREE_MONTHS} meses — la descarga no tiene ese límite.")
 
     default_start = pd.Timestamp(existing_start) if existing_start else pd.Timestamp("2023-01-01")
     return st.date_input("Importar histórico desde", default_start, format="DD/MM/YYYY")
@@ -1660,13 +1676,12 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
 
     # `start` ya viene calculado de _history_start_field(), dentro del
     # expander "Conexión y licencia" (§main) — aquí solo se usa. La única
-    # razón para seguir sabiendo si hay modo de prueba es el aviso de más
-    # abajo, en el botón "Sincronizar" — la descarga en sí NO se limita en
-    # modo de prueba (a petición expresa: solo el análisis, capado de
+    # razón para seguir sabiendo el estado de la licencia es el aviso de
+    # más abajo, en el botón "Sincronizar" — la descarga en sí NUNCA se
+    # limita por licencia (a petición expresa: solo el análisis, capado de
     # verdad en main() sobre `funded`), para no obligar a re-sincronizar
-    # cuando se active la licencia.
-    trial_floor = ((pd.Timestamp.today().normalize() - pd.DateOffset(months=TRIAL_MONTHS)).date()
-                   if license_mode == "trial" else None)
+    # cuando se consiga o se amplíe la licencia.
+    show_blocked_notice = license_mode == "blocked"
 
     if existing_start:
         d = dt.datetime.strptime(existing_start, "%Y%m%d").date()
@@ -1693,11 +1708,11 @@ def sidebar_source(license_mode: str, token: str, qid: str, start: pd.Timestamp)
         from q4_ingest import FlexClient, validate_query
         from q4_sync import backfill
 
-        if trial_floor is not None:
-            st.info(f"Sin licencia activa: puedes descargar todo el histórico que "
-                    f"quieras, pero el **análisis** se limita a los últimos "
-                    f"{TRIAL_MONTHS} meses (desde {trial_floor.strftime('%d/%m/%Y')}) "
-                    "hasta que verifiques tu licencia en el sidebar.")
+        if show_blocked_notice:
+            st.info("Sin licencia activa: puedes descargar todo el histórico que "
+                    "quieras, pero el **análisis** queda bloqueado hasta que "
+                    "consigas una licencia válida — gratuita o de pago, ver la "
+                    "pestaña Configuración.")
 
         # Candado por query: el limitador de ritmo de FlexClient (1 req/s,
         # 10/min) vive EN MEMORIA, dentro de esa instancia — no es global. Si
@@ -2859,6 +2874,8 @@ def _guide_callout(tone: str, icon: str, html: str):
 
 ONBOARDING_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                      "assets", "onboarding")
+BRANDING_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "assets", "branding")
 
 
 def _onboarding_screenshot(label: str, filename: str):
@@ -2870,6 +2887,70 @@ def _onboarding_screenshot(label: str, filename: str):
         return
     with st.expander(label):
         st.image(path, use_container_width=True)
+
+
+def _clickable_logo(filename: str, href: str, alt: str, title: str, subtitle: str) -> None:
+    """CTA con logo clicable — SOLO para el paso "Introduce tu licencia" de
+    configuracion_view() (el de Substack). Opcional, igual que
+    _onboarding_screenshot: si el fichero no está (aún) en assets/branding/,
+    no rompe la guía, sólo no se muestra.
+
+    Va por `components.html()` (un <iframe> propio), NO por `st.markdown()`
+    — comprobado en vivo con dos fallos distintos por el camino de
+    markdown: (1) como `<img src="data:...;base64,...">`, el navegador NUNCA
+    ejecuta las animaciones CSS (@keyframes) de un SVG cargado como recurso
+    de imagen — el texto "Quant4all" se quedaba sin revelar, congelado en
+    su estado inicial; (2) incrustando el SVG tal cual en el HTML de
+    `st.markdown(unsafe_allow_html=True)`, el propio bloque `<style>` del
+    SVG salía TRUNCADO a medio comentario (el resto del dibujo —fondo,
+    rejilla, texto— desaparecía entero) — algo en el paso de Markdown a
+    HTML de Streamlit no digiere bien un `<style>` con @keyframes dentro de
+    contenido "unsafe". Un `<iframe>` no pasa por ninguno de los dos
+    caminos: recibe el HTML tal cual, sin markdown ni saneado.
+
+    Las variables CSS del tema (var(--card) etc.) NO cruzan al iframe —
+    tiene su propio documento — así que aquí se usan los hex ya resueltos
+    de las globals BG/CARD/FG/MUTED/BORDER/POS (ver _apply_theme_palette,
+    ya corridas para este rerun antes de llegar aquí)."""
+    path = os.path.join(BRANDING_ASSETS_DIR, filename)
+    if not os.path.exists(path):
+        return
+    ext = os.path.splitext(filename)[1].lstrip(".").lower() or "png"
+    if ext == "svg":
+        with open(path, encoding="utf-8") as fh:
+            svg_markup = fh.read()
+        # Sin el width/height fijo del fichero (pensado para 600×600) — el
+        # CSS de abajo manda sobre el tamaño real en la tarjeta; el propio
+        # viewBox interno ya escala el dibujo.
+        svg_markup = re.sub(r'(<svg\b[^>]*?)\s+width="[^"]*"', r"\1", svg_markup, count=1)
+        svg_markup = re.sub(r'(<svg\b[^>]*?)\s+height="[^"]*"', r"\1", svg_markup, count=1)
+        logo_html = svg_markup
+    else:
+        with open(path, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode("ascii")
+        logo_html = f'<img src="data:image/{ext};base64,{b64}" alt="{alt}"/>'
+    components.html(f"""
+        <style>
+          html, body {{ margin:0; padding:0; background:transparent; }}
+          a {{ display:flex; align-items:center; gap:14px; border-radius:8px;
+            padding:12px 14px; border:1px solid {BORDER}; background:{CARD};
+            text-decoration:none; box-sizing:border-box; height:100%;
+            transition:border-color .15s ease, transform .15s ease;
+            font-family:'Fira Sans',Helvetica,Arial,sans-serif; }}
+          a:hover {{ border-color:{POS}; transform:translateY(-1px); }}
+          a:focus-visible {{ outline:2px solid {POS}; outline-offset:2px; }}
+          .logo {{ width:52px; height:52px; flex:0 0 auto; border-radius:8px;
+            overflow:hidden; display:block; }}
+          .logo svg, .logo img {{ width:100%; height:100%; display:block; }}
+          .copy {{ display:flex; flex-direction:column; gap:2px; min-width:0; }}
+          .copy strong {{ color:{FG}; font-size:14.5px; font-weight:600; }}
+          .copy small {{ color:{MUTED}; font-size:12.5px; }}
+        </style>
+        <a href="{href}" target="_blank" rel="noopener">
+          <span class="logo" role="img" aria-label="{alt}">{logo_html}</span>
+          <span class="copy"><strong>{title}</strong><small>{subtitle}</small></span>
+        </a>
+    """, height=82)
 
 
 # Nombres EXACTOS del Client Portal en español (capturas de una query ya
@@ -2955,15 +3036,16 @@ def configuracion_view():
                 "el lateral, sin que se borre nada de lo ya guardado.")
 
     _guide_step("02", "target", "Introduce tu licencia",
-                "El código llega en el <strong>último correo de pago</strong> de tu "
-                "suscripción de Substack. Pégalo en el campo <strong>Licencia</strong>, "
-                "arriba del todo en el lateral, y pulsa «Verificar licencia». Sin él "
-                "puedes seguir probando: sincroniza todo el histórico que quieras "
-                "(así no hay que repetirlo luego), pero Métricas solo analiza los "
-                "últimos 6 meses, y Efecto divisa, Operaciones e Informe quedan "
-                "bloqueadas hasta verificarlo.")
+                "Necesitas una licencia válida para probar la aplicación. Consigue "
+                "una al suscribirte <strong>GRATIS</strong> a Quant4all en Substack.")
+    _clickable_logo("substack_logo.svg", SUBSTACK_URL,
+                    "Suscríbete a Quant4all en Substack",
+                    "Suscríbete gratis a Quant4all | Systematic trading en Substack",
+                    "El email de bienvenida trae tu licencia gratuita")
 
     _guide_step("03", "layers", "Crea la Flex Query en el Client Portal",
+                "Esto es un proceso necesario para poder sincronizar la información de "
+                "IBKR. Sólo tienes que hacerlo una vez. "
                 "Inicia sesión en el <strong>Client Portal</strong> de IBKR → engranaje de "
                 "Configuración → Configuración de informes → <strong>Consultas Flex "
                 "(Flex Queries)</strong> → crear una nueva <strong>Activity Flex Query</strong>. "
@@ -3092,6 +3174,15 @@ def main():
         configuracion_view()
         st.stop()
 
+    # Sin al menos licencia gratuita, ningún panel de análisis se muestra —
+    # la misma guía de Configuración (que ya lleva el paso de licencia con
+    # el enlace a Substack) hace de pantalla, en vez de inventar una nueva.
+    # La descarga/sincronización de arriba en el sidebar ya funcionó igual
+    # sin licencia (ver sidebar_source/_history_start_field).
+    if license_mode == "blocked":
+        configuracion_view()
+        st.stop()
+
     # Fase 3 del plan de escalabilidad: adelanta la descarga de Yahoo a
     # segundo plano en cuanto hay dataset, en vez de esperar a que el
     # usuario abra la pestaña Benchmark (ver docstring de la función).
@@ -3105,6 +3196,13 @@ def main():
     currency = ds.base_currency
     rf = 0.0
     accounts = st.sidebar.multiselect("Cuentas", ds.accounts, default=ds.accounts)
+    if license_mode == "free" and set(accounts) != set(ds.accounts):
+        # Licencia gratuita: la selección de cuentas no aplica al cálculo —
+        # se ve, se puede tocar, pero siempre se analiza con todas (ver
+        # también el selector de periodo, más abajo, mismo mecanismo).
+        st.sidebar.warning("Cambiar las cuentas requiere licencia completa — "
+                          "se sigue mostrando con todas.")
+        accounts = ds.accounts
 
     # Benchmark: se elige AQUÍ, al principio, y de ahí en adelante aparece
     # como comparativa en Evolución, Riesgo, la tabla por año y las ventanas
@@ -3148,32 +3246,34 @@ def main():
 
         funded_all = analyzable_dates(ds, accounts or None)
 
-        # Sin licencia activa, el periodo analizable se capa a los últimos
-        # TRIAL_MONTHS SIEMPRE — independientemente de cuánto histórico haya
-        # ya descargado/sincronizado (p. ej. de cuando la licencia sí estaba
-        # activa, o de un backfill hecho antes de verificarla). Se filtra
-        # `funded` aquí, antes de que nada más lo use (slider, date_input,
-        # el "else" de más abajo) — así el tope se respeta pase lo que pase
-        # por debajo, no solo cuando el slider tiene rango de sobra.
+        # Con licencia gratuita, el periodo analizable se capa a los
+        # últimos FREE_MONTHS SIEMPRE — independientemente de cuánto
+        # histórico haya ya descargado/sincronizado (p. ej. de cuando la
+        # licencia era completa, o de un backfill hecho antes de
+        # verificarla). Se filtra `funded` aquí, antes de que nada más lo
+        # use (slider, date_input, el "else" de más abajo) — así el tope se
+        # respeta pase lo que pase por debajo, no solo cuando el slider
+        # tiene rango de sobra. Con "blocked" no se llega hasta aquí (ver
+        # el corte tras sidebar_source(), más arriba en main()).
         funded = funded_all
-        if license_mode == "trial":
-            trial_floor_s = (pd.Timestamp.today().normalize()
-                             - pd.DateOffset(months=TRIAL_MONTHS)).strftime("%Y%m%d")
-            funded = [d for d in funded_all if d >= trial_floor_s]
+        if license_mode == "free":
+            free_floor_s = (pd.Timestamp.today().normalize()
+                            - pd.DateOffset(months=FREE_MONTHS)).strftime("%Y%m%d")
+            funded = [d for d in funded_all if d >= free_floor_s]
 
         if len(funded) < 2:
             st.warning("No hay histórico con NAV positivo suficiente para analizar."
                        if license_mode == "full" else
-                       f"Sin licencia activa, solo se pueden analizar los últimos "
-                       f"{TRIAL_MONTHS} meses — y en ese tramo no hay histórico con NAV "
-                       "positivo suficiente. Verifica tu licencia en el lateral para "
+                       f"Con licencia gratuita, solo se pueden analizar los últimos "
+                       f"{FREE_MONTHS} meses — y en ese tramo no hay histórico con NAV "
+                       "positivo suficiente. Consigue la licencia completa para "
                        "levantar el límite.")
             st.stop()
 
-        if license_mode == "trial" and funded[0] > funded_all[0]:
-            st.info(f"Sin licencia activa: análisis limitado a los últimos {TRIAL_MONTHS} "
+        if license_mode == "free" and funded[0] > funded_all[0]:
+            st.info(f"Licencia gratuita: análisis limitado a los últimos {FREE_MONTHS} "
                     f"meses (desde {funded[0][6:]}/{funded[0][4:6]}/{funded[0][:4]}), aunque "
-                    "tengas más sincronizado. Verifica tu licencia en el lateral para "
+                    "tengas más sincronizado. Consigue la licencia completa para "
                     "levantar el límite.")
         elif funded[0] > ds.dates[0]:
             st.info(f"Los datos arrancan con NAV positivo el {funded[0][6:]}/{funded[0][4:6]}/"
@@ -3211,6 +3311,14 @@ def main():
         cB.date_input("Hasta", min_value=lo_d, max_value=hi_d, key="din_to",
                       on_change=_from_inputs, format="DD/MM/YYYY")
         lo_sel, hi_sel = st.session_state.sld
+        if license_mode == "free" and (lo_sel, hi_sel) != (lo_d, hi_d):
+            # Licencia gratuita: el slider/date_input se ven y se pueden
+            # mover con normalidad, pero el cálculo ignora el cambio y usa
+            # siempre el rango completo permitido — mismo mecanismo que el
+            # multiselect de cuentas, más arriba.
+            st.sidebar.warning("Cambiar el periodo requiere licencia completa — "
+                              "se sigue mostrando el rango completo.")
+            lo_sel, hi_sel = lo_d, hi_d
         lo_s, hi_s = lo_sel.strftime("%Y%m%d"), hi_sel.strftime("%Y%m%d")
         dates = [d for d in funded if lo_s <= d <= hi_s]
     else:

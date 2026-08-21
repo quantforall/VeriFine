@@ -1,0 +1,129 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 600" width="600" height="600" role="img" aria-label="Quant4all">
+  <title>Quant4all</title>
+
+  <defs>
+    <radialGradient id="bgGlow" cx="50%" cy="45%" r="70%">
+      <stop offset="0%" stop-color="#12294a"/>
+      <stop offset="100%" stop-color="#08172e"/>
+    </radialGradient>
+
+    <linearGradient id="sweepGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%"   stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="45%"  stop-color="#ffffff" stop-opacity="0.55"/>
+      <stop offset="55%"  stop-color="#ff9d2e" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+
+    <clipPath id="wipe" clipPathUnits="userSpaceOnUse">
+      <rect class="wipeRect" x="0" y="0" width="600" height="600"/>
+    </clipPath>
+
+    <clipPath id="textClip" clipPathUnits="userSpaceOnUse">
+      <text x="300" y="285" class="ft" font-size="132">Quant</text>
+      <text x="300" y="412" class="ft" font-size="132">4all</text>
+    </clipPath>
+
+    <filter id="softGlow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="10" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <style>
+      .ft{
+        font-family:"Helvetica Neue",Helvetica,Arial,"Segoe UI",Roboto,sans-serif;
+        font-weight:500;
+        text-anchor:middle;
+        letter-spacing:-2px;
+      }
+
+      /* --- barrido de entrada --- */
+      .wipeRect{
+        transform-box:fill-box;
+        transform-origin:left center;
+        animation:wipeIn 1.5s cubic-bezier(.65,0,.2,1) forwards;
+      }
+      @keyframes wipeIn{
+        0%   { transform:scaleX(0); }
+        100% { transform:scaleX(1); }
+      }
+
+      /* --- rejilla quant de fondo --- */
+      .grid{
+        opacity:0;
+        animation:gridIn 2.2s ease-out forwards;
+      }
+      @keyframes gridIn{
+        0%   { opacity:0; }
+        100% { opacity:.14; }
+      }
+
+      /* --- linea de datos --- */
+      .spark{
+        stroke-dasharray:900;
+        stroke-dashoffset:900;
+        animation:draw 2.6s ease-out .5s forwards, pulseLine 5s ease-in-out 3.1s infinite;
+      }
+      @keyframes draw{ to{ stroke-dashoffset:0; } }
+      @keyframes pulseLine{
+        0%,100%{ opacity:.35; }
+        50%    { opacity:.75; }
+      }
+
+      /* --- el 4 naranja late --- */
+      .four{
+        animation:beat 3.4s ease-in-out 1.6s infinite;
+        transform-box:fill-box;
+        transform-origin:center;
+      }
+      @keyframes beat{
+        0%,72%,100% { fill:#F5871F; }
+        82%         { fill:#ffb75e; }
+      }
+
+      /* --- brillo que cruza el texto --- */
+      .sweep{
+        animation:sweepMove 4.5s ease-in-out 2s infinite;
+      }
+      @keyframes sweepMove{
+        0%      { transform:translateX(-520px); }
+        45%,100%{ transform:translateX(620px); }
+      }
+
+      @media (prefers-reduced-motion: reduce){
+        .wipeRect,.grid,.spark,.four,.sweep{ animation:none; }
+        .wipeRect{ transform:scaleX(1); }
+        .grid{ opacity:.14; }
+        .spark{ stroke-dashoffset:0; }
+      }
+    </style>
+  </defs>
+
+  <!-- fondo -->
+  <rect width="600" height="600" fill="url(#bgGlow)"/>
+
+  <!-- rejilla -->
+  <g class="grid" stroke="#7fa8d9" stroke-width="1">
+    <path d="M0 120H600M0 240H600M0 360H600M0 480H600"/>
+    <path d="M120 0V600M240 0V600M360 0V600M480 0V600"/>
+  </g>
+
+  <!-- sparkline -->
+  <path class="spark" d="M40 470 L110 440 L160 462 L215 396 L275 424 L330 350 L390 378 L450 300 L510 330 L560 246"
+        fill="none" stroke="#F5871F" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" opacity=".55"/>
+
+  <!-- logotipo -->
+  <g clip-path="url(#wipe)">
+    <text x="300" y="285" class="ft" font-size="132" fill="#F7F9FC">Quant</text>
+    <text x="300" y="412" class="ft" font-size="132" fill="#F7F9FC">
+      <tspan class="four" fill="#F5871F">4</tspan><tspan>all</tspan>
+    </text>
+
+    <!-- brillo recortado a la forma del texto -->
+    <g clip-path="url(#textClip)">
+      <rect class="sweep" x="0" y="120" width="140" height="360" fill="url(#sweepGrad)" filter="url(#softGlow)"/>
+    </g>
+  </g>
+</svg>
