@@ -3458,6 +3458,14 @@ def main():
 
         def _from_inputs():
             a, b = st.session_state.din_from, st.session_state.din_to
+            # Al borrar una fecha para escribir otra, Streamlit deja ese
+            # widget en None un rerun antes de que el usuario termine de
+            # teclear la nueva — sin este corte, `a > b` compara None
+            # contra date y revienta (TypeError). Se ignora el rerun a
+            # medio escribir; el slider se queda con el último rango
+            # válido hasta que ambas fechas vuelvan a ser completas.
+            if a is None or b is None:
+                return
             if a > b:
                 a, b = b, a
             st.session_state.sld = (a, b)

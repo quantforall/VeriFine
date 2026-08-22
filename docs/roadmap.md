@@ -23,6 +23,15 @@ Backlog vivo. Ordenado de "antes de usarlo en serio" a "proyectos de v2".
   selector ya lo permite; falta ponerlo por defecto.
 - [ ] **Responsive móvil (375 px)**: las stat-cards usan grid `auto-fit` (reflowean),
   pero no se ha verificado a fondo en móvil.
+- [ ] **Pestaña propia de Dividendos.** Hoy los dividendos sólo se ven como una
+  línea (`dividendos_local`) dentro del agregado por ticker de Operaciones
+  (§20.9) — cuentan como rendimiento en el TWR (§3) pero no tienen vista
+  dedicada. Una pestaña separada podría mostrar: dividendo por ticker/fecha,
+  yield sobre coste, evolución mensual/anual, retención fiscal (`Withholding
+  Tax`) descontada vs. bruto, y el total ya usado hoy dentro de Operaciones.
+  Fuente: `CashTransaction` con `type` en {Dividends, Payment In Lieu Of
+  Dividends}, ya parseada — es una vista nueva sobre datos existentes, no un
+  cálculo nuevo (mismo criterio que Informe, §22.3).
 
 ## Otros brókers (v2)
 
